@@ -1,6 +1,13 @@
 #include "pdf_renderer.h"
 #include "utils.h"
 #include <qdatetime.h>
+#include <algorithm>
+#include <chrono>
+#include <atomic>
+#include <thread>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 
 extern bool LINEAR_TEXTURE_FILTERING;
 extern int NUM_V_SLICES;
@@ -16,6 +23,276 @@ extern float CUSTOM_TEXT_COLOR[3];
 extern float CUSTOM_COLOR_CONTRAST;
 extern int MAX_PENDING_REQUESTS;
 extern unsigned int CACHE_INVALID_MILIES;
+
+// Rendered pages are only ever uploaded to OpenGL textures. On desktop OpenGL we render straight into
+// BGRA, which is the drivers' native texture layout, so the upload in the main thread is a plain copy
+// instead of a per pixel RGB -> BGRA conversion (about 3x faster for a full page on macOS).
+#if !defined(SIOYEK_ANDROID) && defined(GL_BGRA) && defined(GL_UNSIGNED_INT_8_8_8_8_REV)
+#define SIOYEK_BGRA_TEXTURES
+#endif
+
+// A device that only decodes the images a draw device would need (and so puts them in mupdf's
+// store). When a page is drawn in bands, each band asks for just the part of an image it covers.
+// Those parts don't come from a common decode, and decoding JPEG or JBIG2 data up to a band's last
+// row means decoding everything above it too, so the bands of a scanned page would decode the
+// image over and over. mupdf reuses a cached decode of a whole image for any part of it though, so
+// decoding the whole images once before drawing the bands avoids that.
+struct ImagePrefetchDevice {
+    fz_device super;
+    fz_rect area;
+    // total area of `area` that images are drawn on
+    float image_area;
+};
+
+static void prefetch_image(fz_context* ctx, fz_device* dev, fz_image* image, fz_matrix ctm) {
+    ImagePrefetchDevice* prefetch_dev = (ImagePrefetchDevice*)dev;
+    fz_rect visible = fz_intersect_rect(fz_transform_rect(fz_unit_rect, ctm), prefetch_dev->area);
+    if (fz_is_empty_rect(visible)) {
+        return;
+    }
+    prefetch_dev->image_area += (visible.x1 - visible.x0) * (visible.y1 - visible.y0);
+    // the draw device decides the resolution to decode at from this matrix, and so does the cache key
+    fz_matrix local_ctm = fz_gridfit_matrix(0, ctm);
+    int dw, dh;
+    fz_pixmap* pixmap = fz_get_pixmap_from_image(ctx, image, nullptr, &local_ctm, &dw, &dh);
+    fz_drop_pixmap(ctx, pixmap);
+}
+
+static void prefetch_fill_image(fz_context* ctx, fz_device* dev, fz_image* image, fz_matrix ctm, float alpha, fz_color_params color_params) {
+    if (alpha != 0) prefetch_image(ctx, dev, image, ctm);
+}
+
+static void prefetch_fill_image_mask(fz_context* ctx, fz_device* dev, fz_image* image, fz_matrix ctm, fz_colorspace* colorspace, const float* color, float alpha, fz_color_params color_params) {
+    if (alpha != 0) prefetch_image(ctx, dev, image, ctm);
+}
+
+static void prefetch_clip_image_mask(fz_context* ctx, fz_device* dev, fz_image* image, fz_matrix ctm, fz_rect scissor) {
+    prefetch_image(ctx, dev, image, ctm);
+}
+
+// Decodes the images of `list` that are drawn on `area` and returns the fraction of `area` they cover.
+static float prefetch_display_list_images(fz_context* ctx, fz_display_list* list, fz_matrix transform_matrix, fz_rect area) {
+    ImagePrefetchDevice* dev = fz_new_derived_device(ctx, ImagePrefetchDevice);
+    dev->super.fill_image = prefetch_fill_image;
+    dev->super.fill_image_mask = prefetch_fill_image_mask;
+    dev->super.clip_image_mask = prefetch_clip_image_mask;
+    dev->area = area;
+    dev->image_area = 0;
+    float coverage = 0;
+    fz_try(ctx) {
+        fz_run_display_list(ctx, list, &dev->super, transform_matrix, area, nullptr);
+        fz_close_device(ctx, &dev->super);
+        float total = (area.x1 - area.x0) * (area.y1 - area.y0);
+        coverage = total > 0 ? dev->image_area / total : 0;
+    }
+    fz_always(ctx) {
+        fz_drop_device(ctx, &dev->super);
+    }
+    fz_catch(ctx) {
+        fz_rethrow(ctx);
+    }
+    return coverage;
+}
+
+// Draws rows [y0, y1) of `pixmap` from `list`, through a view of just those rows so that threads
+// drawing different bands never touch the same memory.
+static void draw_display_list_band(fz_context* ctx, fz_display_list* list, fz_matrix transform_matrix, fz_pixmap* pixmap, int y0, int y1) {
+    fz_irect band = { pixmap->x, y0, pixmap->x + pixmap->w, y1 };
+    fz_pixmap* view = fz_new_pixmap_from_pixmap(ctx, pixmap, &band);
+    fz_device* draw_device = nullptr;
+    fz_var(draw_device);
+    fz_try(ctx) {
+        // like mutool draw's banding: the device works in pixels and the page transform is applied
+        // when running the list, so that the band rectangle culls in the same (pixel) space
+        draw_device = fz_new_draw_device(ctx, fz_identity, view);
+        fz_run_display_list(ctx, list, draw_device, transform_matrix, fz_rect_from_irect(band), nullptr);
+        fz_close_device(ctx, draw_device);
+    }
+    fz_always(ctx) {
+        fz_drop_device(ctx, draw_device);
+        fz_drop_pixmap(ctx, view);
+    }
+    fz_catch(ctx) {
+        fz_rethrow(ctx);
+    }
+}
+
+fz_pixmap* render_request_pixmap(fz_context* mupdf_context, fz_document* doc, const RenderRequest& req, int helper_threads, int* bands_used) {
+    fz_matrix transform_matrix = fz_pre_scale(fz_identity, req.zoom_level * req.display_scale, req.zoom_level * req.display_scale);
+
+#ifdef SIOYEK_BGRA_TEXTURES
+    fz_colorspace* colorspace = fz_device_bgr(mupdf_context);
+    int alpha = 1;
+#else
+    fz_colorspace* colorspace = fz_device_rgb(mupdf_context);
+    int alpha = 0;
+#endif
+
+    fz_page* page = fz_load_page(mupdf_context, doc, req.page);
+    fz_pixmap* rendered_pixmap = nullptr;
+    fz_device* draw_device = nullptr;
+    fz_display_list* list = nullptr;
+
+    int final_num_bands = 1;
+
+    fz_var(rendered_pixmap);
+    fz_var(draw_device);
+    fz_var(list);
+    fz_var(final_num_bands);
+
+    fz_try(mupdf_context) {
+        fz_rect rect = fz_bound_page(mupdf_context, page);
+        fz_irect bbox;
+        if (req.slice_index == -1) {
+            bbox = fz_round_rect(fz_transform_rect(rect, transform_matrix));
+        }
+        else {
+            bbox = get_index_irect(rect, req.slice_index, transform_matrix, req.num_h_slices, req.num_v_slices);
+        }
+
+        rendered_pixmap = fz_new_pixmap_with_bbox(mupdf_context, colorspace, bbox, nullptr, alpha);
+        // opaque white background (this also sets the alpha channel to 255)
+        fz_clear_pixmap_with_value(mupdf_context, rendered_pixmap, 0xFF);
+
+        int num_bands = std::max(1, std::min(helper_threads + 1, rendered_pixmap->h / 64));
+        if (num_bands == 1) {
+            draw_device = fz_new_draw_device(mupdf_context, transform_matrix, rendered_pixmap);
+
+            if (req.should_render_annotations) {
+                fz_run_page(mupdf_context, page, draw_device, fz_identity, nullptr); // todo: use cookie to report progress
+            }
+            else {
+                fz_run_page_contents(mupdf_context, page, draw_device, fz_identity, nullptr); // todo: use cookie to report progress
+            }
+            fz_close_device(mupdf_context, draw_device);
+        }
+        else {
+            // Heavy page: interpret it once into a display list and rasterize horizontal bands of
+            // it in parallel. Rasterizing (filling paths, decoding and scaling images) is where the
+            // time goes on such pages, so this divides most of the render time by the number of bands.
+            if (req.should_render_annotations) {
+                list = fz_new_display_list_from_page(mupdf_context, page);
+            }
+            else {
+                list = fz_new_display_list_from_page_contents(mupdf_context, page);
+            }
+
+            float image_coverage = prefetch_display_list_images(mupdf_context, list, transform_matrix, fz_rect_from_irect(bbox));
+            if (image_coverage > 0.5f) {
+                // Mostly an image (e.g. a scanned page): decoding it can't be split, and while
+                // scrolling, bands scaling a big image in parallel slowed down the other pages being
+                // rendered more than they sped up this one. Draw it in one piece.
+                num_bands = 1;
+            }
+
+            final_num_bands = num_bands;
+            int y0 = rendered_pixmap->y;
+            int h = rendered_pixmap->h;
+            auto band_y = [&](int band) { return y0 + (int)(((long long)h * band) / num_bands); };
+
+            std::vector<fz_context*> helper_contexts;
+            std::vector<std::thread> helpers;
+            std::atomic<bool> helper_failed{ false };
+            for (int band = 1; band < num_bands; band++) {
+                helper_contexts.push_back(fz_clone_context(mupdf_context));
+            }
+            for (int band = 1; band < num_bands; band++) {
+                fz_context* ctx = helper_contexts[band - 1];
+                helpers.emplace_back([&, ctx, band]() {
+                    fz_try(ctx) {
+                        draw_display_list_band(ctx, list, transform_matrix, rendered_pixmap, band_y(band), band_y(band + 1));
+                    }
+                    fz_catch(ctx) {
+                        helper_failed = true;
+                    }
+                    });
+            }
+            bool failed = false;
+            fz_try(mupdf_context) {
+                draw_display_list_band(mupdf_context, list, transform_matrix, rendered_pixmap, band_y(0), band_y(1));
+            }
+            fz_catch(mupdf_context) {
+                failed = true;
+            }
+            for (auto& helper : helpers) {
+                helper.join();
+            }
+            for (fz_context* ctx : helper_contexts) {
+                fz_drop_context(ctx);
+            }
+            if (failed || helper_failed) {
+                fz_throw(mupdf_context, FZ_ERROR_GENERIC, "could not render page band");
+            }
+        }
+    }
+    fz_always(mupdf_context) {
+        fz_drop_device(mupdf_context, draw_device);
+        fz_drop_display_list(mupdf_context, list);
+        fz_drop_page(mupdf_context, page);
+    }
+    fz_catch(mupdf_context) {
+        fz_drop_pixmap(mupdf_context, rendered_pixmap);
+        fz_rethrow(mupdf_context);
+    }
+
+    if (GAMMA != 1.0f) {
+        fz_gamma_pixmap(mupdf_context, rendered_pixmap, GAMMA);
+    }
+    if (bands_used) {
+        *bands_used = final_num_bands;
+    }
+    return rendered_pixmap;
+}
+
+GLuint create_texture_from_pixmap(fz_pixmap* pixmap) {
+    GLuint result = 0;
+    glGenTextures(1, &result);
+    glBindTexture(GL_TEXTURE_2D, result);
+
+    if (LINEAR_TEXTURE_FILTERING) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    }
+    else {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+
+#ifdef GL_CLAMP
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+#else
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+#endif
+
+    // rows of a pixmap are tightly packed, so unless each pixel is 4 bytes they are not necessarily
+    // aligned to 4 bytes
+    int alignment = (pixmap->n == 4) ? 4 : 1;
+    glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+#ifdef SIOYEK_BGRA_TEXTURES
+    if (pixmap->n == 4) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, pixmap->w, pixmap->h, 0, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, pixmap->samples);
+    }
+    else
+#endif
+    {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, pixmap->w, pixmap->h, 0, GL_RGB, GL_UNSIGNED_BYTE, pixmap->samples);
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    return result;
+}
+
+static int num_performance_cores() {
+#ifdef __APPLE__
+    int count = 0;
+    size_t size = sizeof(count);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &count, &size, nullptr, 0) == 0 && count > 0) {
+        return count;
+    }
+#endif
+    return std::max(1u, std::thread::hardware_concurrency());
+}
 
 PdfRenderer::PdfRenderer(int num_threads, bool* should_quit_pointer, fz_context* context_to_clone) : context_to_clone(context_to_clone),
 pixmaps_to_drop(num_threads),
@@ -33,6 +310,11 @@ num_threads(num_threads)
     for (int i = 0; i < num_threads; i++) {
         thread_busy_status.push_back(false);
     }
+
+    // Cores that aren't busy rendering can help rendering heavy pages (see render_request_pixmap).
+    // One is left for the main thread. Only performance cores count: a page rendered in bands is only
+    // done when its slowest band is, so a band on an efficiency core would delay the whole page.
+    band_cores = std::max(0, num_performance_cores() - 1);
     QObject::connect(&garbage_collect_timer, &QTimer::timeout, [&]() {
         delete_old_pages();
         });
@@ -167,33 +449,7 @@ GLuint PdfRenderer::find_rendered_page(std::wstring path, int page, bool should_
                     result = cached_resp.texture;
                 }
                 else {
-                    glGenTextures(1, &result);
-                    glBindTexture(GL_TEXTURE_2D, result);
-
-                    if (LINEAR_TEXTURE_FILTERING) {
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                    }
-                    else {
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-                    }
-
-#ifdef GL_CLAMP
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
-#else
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-#endif
-
-
-                    // OpenGL usually expects powers of two textures and since our pixmaps dimensions are
-                    // often not powers of two, we set the unpack alignment to 1 (no alignment) 
-
-                    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, cached_resp.pixmap->w, cached_resp.pixmap->h, 0, GL_RGB, GL_UNSIGNED_BYTE, cached_resp.pixmap->samples);
-                    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+                    result = create_texture_from_pixmap(cached_resp.pixmap);
 
                     // don't need the pixmap anymore
                     pixmap_drop_mutex[cached_resp.thread].lock();
@@ -242,8 +498,9 @@ GLuint PdfRenderer::try_closest_rendered_page(std::wstring doc_path, int page, b
 
     float min_diff = 10000.0f;
     GLuint best_texture = 0;
+    RenderResponse* best_response = nullptr;
 
-    for (const auto& cached_resp : cached_responses) {
+    for (auto& cached_resp : cached_responses) {
         if (cached_resp.pending) continue;
         if ((cached_resp.request.slice_index == index) &&
             (cached_resp.request.num_h_slices == num_h_slices) &&
@@ -257,10 +514,16 @@ GLuint PdfRenderer::try_closest_rendered_page(std::wstring doc_path, int page, b
             if (diff <= min_diff) {
                 min_diff = diff;
                 best_texture = cached_resp.texture;
+                best_response = &cached_resp;
                 if (page_width) *page_width = static_cast<int>(cached_resp.width * zoom_level / cached_resp.request.zoom_level);
                 if (page_height) *page_height = static_cast<int>(cached_resp.height * zoom_level / cached_resp.request.zoom_level);
             }
         }
+    }
+    if (best_response) {
+        // the texture is going to be drawn until the requested one is rendered, so it counts as used
+        // and delete_old_pages won't delete it from under us
+        best_response->last_access_time = QDateTime::currentMSecsSinceEpoch();
     }
     cached_response_mutex.unlock();
     return best_texture;
@@ -281,13 +544,6 @@ void PdfRenderer::delete_old_pages(bool force_all, bool invalidate_all) {
     cached_response_mutex.lock();
     std::vector<int> indices_to_delete;
     unsigned int now = QDateTime::currentMSecsSinceEpoch();
-    std::vector<int> cached_response_times;
-
-    for (size_t i = 0; i < cached_responses.size(); i++) {
-        cached_response_times.push_back(now - cached_responses[i].last_access_time);
-    }
-
-    int N = num_cached_pages * NUM_V_SLICES * NUM_H_SLICES;
 
     if (invalidate_all) {
         for (size_t i = 0; i < cached_responses.size(); i++) {
@@ -302,20 +558,39 @@ void PdfRenderer::delete_old_pages(bool force_all, bool invalidate_all) {
         }
         are_documents_invalidated = true;
     }
-    else if (cached_response_times.size() > (size_t) N) {
-        // we never delete N most recent pages
-        // todo: make this configurable
-        std::nth_element(cached_response_times.begin(), cached_response_times.begin() + N - 1, cached_response_times.end());
-
-
-        unsigned int time_threshold = now - cached_response_times[N - 1];
-
+    else {
+        // We never delete the most recently used responses that add up to num_cached_pages pages. A
+        // response for a slice counts as the corresponding fraction of a page. (This used to keep the
+        // num_cached_pages * NUM_V_SLICES * NUM_H_SLICES most recent responses, but pages are only
+        // sliced in special cases, so it kept 25 whole pages alive, ~17MB of texture each on a retina
+        // display.) We also never delete what was drawn in the latest frame, even when that is more
+        // than num_cached_pages pages (e.g. when zoomed out), nor requests that are still being
+        // rendered, since the worker thread still needs their entry to store the result.
+        std::vector<int> by_recency;
         for (size_t i = 0; i < cached_responses.size(); i++) {
-            if ((cached_responses[i].last_access_time < time_threshold)
-                && ((now - cached_responses[i].last_access_time) > CACHE_INVALID_MILIES)) {
+            if (!cached_responses[i].pending) {
+                by_recency.push_back(i);
+            }
+        }
+        std::sort(by_recency.begin(), by_recency.end(), [&](int lhs, int rhs) {
+            return cached_responses[lhs].last_access_time > cached_responses[rhs].last_access_time;
+            });
+
+        // textures used within this long of the most recent use were drawn in the same frame
+        const unsigned int frame_window = 50;
+        unsigned int latest_access = by_recency.size() > 0 ? cached_responses[by_recency[0]].last_access_time : now;
+
+        float num_pages = 0;
+        for (int i : by_recency) {
+            const RenderResponse& resp = cached_responses[i];
+            num_pages += (resp.request.slice_index == -1) ? 1.0f : 1.0f / (resp.request.num_h_slices * resp.request.num_v_slices);
+            bool in_latest_frame = (latest_access - resp.last_access_time) <= frame_window;
+            if (!in_latest_frame && (num_pages > num_cached_pages + 0.001f) && ((now - resp.last_access_time) > CACHE_INVALID_MILIES)) {
                 indices_to_delete.push_back(i);
             }
         }
+        // the deletion loop below expects increasing indices
+        std::sort(indices_to_delete.begin(), indices_to_delete.end());
     }
 
     // We erase from back to front so that erasing one element does not change
@@ -390,8 +665,6 @@ void PdfRenderer::run_search(int thread_index)
             int i = req.start_page;
             while (num_handled_pages < num_pages && (!pending_search_request.has_value()) && (!(*should_quit_pointer))) {
                 num_handled_pages++;
-
-                fz_page* page = fz_load_page(mupdf_context, doc, i);
 
                 fz_stext_page* stext_page = fz_new_stext_page_from_page_number(mupdf_context, doc, i, nullptr);
 
@@ -509,8 +782,13 @@ void PdfRenderer::run(int thread_index) {
     thread_contexts[thread_index] = mupdf_context;
 
     while (!(*should_quit_pointer)) {
+        // pixmaps that were uploaded to textures (or evicted) since the last iteration. If we only
+        // did this when idle, they would pile up (~17MB each) while the user keeps scrolling.
+        delete_old_pixmaps(thread_index, mupdf_context);
+
         pending_requests_mutex.lock();
 
+        bool quitting = false;
         while (pending_render_requests.size() == 0) {
             pending_requests_mutex.unlock();
             cached_response_mutex.lock();
@@ -521,13 +799,23 @@ void PdfRenderer::run(int thread_index) {
             }
             cached_response_mutex.unlock();
             delete_old_pixmaps(thread_index, mupdf_context);
-            if (*should_quit_pointer) break;
+            if (*should_quit_pointer) {
+                // pending_requests_mutex is not locked here
+                quitting = true;
+                break;
+            }
 
             thread_busy_status[thread_index] = false;
             sleep_ms(100);
             pending_requests_mutex.lock();
         }
-        if (*should_quit_pointer) break;
+        if (quitting) break;
+        if (*should_quit_pointer) {
+            // There are still pending requests and we hold pending_requests_mutex. Release it, otherwise
+            // the other worker threads wait for it forever and joining them on exit hangs.
+            pending_requests_mutex.unlock();
+            break;
+        }
         //cout << "worker thread running ... pending requests: " << pending_render_requests.size() << endl;
 
         RenderRequest req = pending_render_requests[pending_render_requests.size() - 1];
@@ -568,60 +856,22 @@ void PdfRenderer::run(int thread_index) {
 
         if (!is_already_rendered) {
 
+            // -1 until this worker counts as rendering
+            int helpers = -1;
+            fz_var(helpers);
             fz_try(mupdf_context) {
-                fz_matrix transform_matrix = fz_pre_scale(fz_identity, req.zoom_level * req.display_scale, req.zoom_level * req.display_scale);
                 fz_document* doc = get_document_with_path(thread_index, mupdf_context, req.path);
-                fz_pixmap* rendered_pixmap = nullptr;
 
-                //if (AUTO_EMBED_ANNOTATIONS) {
-                //	fz_page* page = fz_load_page(mupdf_context, doc, req.page);
-                //	rendered_pixmap = fz_new_pixmap_from_page_contents(mupdf_context, page, transform_matrix, fz_device_rgb(mupdf_context), 0);
-                //	fz_drop_page(mupdf_context, page);
-                //}
-                //else {
-                if (req.slice_index == -1) {
-                    if (req.should_render_annotations) {
-                        rendered_pixmap = fz_new_pixmap_from_page_number(mupdf_context, doc, req.page, transform_matrix, fz_device_rgb(mupdf_context), 0);
-                    }
-                    else {
-                        fz_page* page = fz_load_page(mupdf_context, doc, req.page);
-                        rendered_pixmap = fz_new_pixmap_from_page_contents(mupdf_context, page, transform_matrix, fz_device_rgb(mupdf_context), 0);
-                        fz_drop_page(mupdf_context, page);
-                    }
-                }
-                else {
-                    fz_page* page = fz_load_page(mupdf_context, doc, req.page);
-                    fz_rect rect = fz_bound_page(mupdf_context, page);
-
-                    fz_irect bbox = get_index_irect(rect, req.slice_index, transform_matrix, req.num_h_slices, req.num_v_slices);
-
-                    rendered_pixmap = fz_new_pixmap_with_bbox(mupdf_context, fz_device_rgb(mupdf_context), bbox, nullptr, 0); // todo: use alpha
-
-                    fz_clear_pixmap_with_value(mupdf_context, rendered_pixmap, 0xFF);
-                    fz_device* draw_device = fz_new_draw_device(mupdf_context, transform_matrix, rendered_pixmap);
-
-                    if (req.should_render_annotations) {
-                        fz_run_page(mupdf_context, page, draw_device, fz_identity, nullptr); // todo: use cookie to report progress
-                    }
-                    else {
-                        fz_run_page_contents(mupdf_context, page, draw_device, fz_identity, nullptr); // todo: use cookie to report progress
-                    }
-
-                    fz_close_device(mupdf_context, draw_device);
-                    fz_drop_device(mupdf_context, draw_device);
-                    fz_drop_page(mupdf_context, page);
-
-                }
-
-                if (GAMMA != 1.0f) {
-                    fz_gamma_pixmap(mupdf_context, rendered_pixmap, GAMMA);
-                }
-
-                RenderResponse resp;
-                resp.thread = thread_index;
-                resp.request = req;
-                resp.texture = 0;
-                resp.invalid = false;
+                rendering_workers++;
+                helpers = acquire_band_helpers(req);
+                auto render_begin = std::chrono::steady_clock::now();
+                int bands_used = 1;
+                fz_pixmap* rendered_pixmap = render_request_pixmap(mupdf_context, doc, req, helpers, &bands_used);
+                float elapsed_ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - render_begin).count();
+                update_render_cost_estimate(req.path, rendered_pixmap, elapsed_ms, bands_used);
+                release_band_helpers(helpers);
+                helpers = -1;
+                rendering_workers--;
 
                 cached_response_mutex.lock();
                 int index = get_pending_response_index_with_thread_index(req, thread_index);
@@ -632,6 +882,10 @@ void PdfRenderer::run(int thread_index) {
                     cached_responses[index].height = rendered_pixmap->h;
                     cached_responses[index].pending = false;
                 }
+                else {
+                    // the entry was deleted while we were rendering (e.g. all pages were invalidated)
+                    fz_drop_pixmap(mupdf_context, rendered_pixmap);
+                }
 
                 cached_response_mutex.unlock();
 
@@ -639,6 +893,11 @@ void PdfRenderer::run(int thread_index) {
 
             }
             fz_catch(mupdf_context) {
+                // helpers is -1 when the render itself succeeded and the counters were already updated
+                if (helpers >= 0) {
+                    release_band_helpers(helpers);
+                    rendering_workers--;
+                }
                 std::cerr << "Error: could not render page" << std::endl;
             }
         }
@@ -739,4 +998,61 @@ int PdfRenderer::get_pending_response_index_with_thread_index(const RenderReques
 
 void PdfRenderer::set_num_cached_pages(int n_cached_pages) {
     num_cached_pages = n_cached_pages;
+}
+
+float PdfRenderer::estimate_render_ms(const RenderRequest& req) {
+    std::lock_guard<std::mutex> lock(render_cost_mutex);
+    auto it = render_ms_per_megapixel.find(req.path);
+    if (it == render_ms_per_megapixel.end()) {
+        return -1;
+    }
+    // the page dimensions aren't known here, estimate the pixel count from a letter sized page
+    float scale = req.zoom_level * req.display_scale;
+    float megapixels = (612.0f * scale) * (792.0f * scale) / 1e6f;
+    if (req.slice_index != -1) {
+        megapixels /= req.num_h_slices * req.num_v_slices;
+    }
+    return it->second * megapixels;
+}
+
+int PdfRenderer::acquire_band_helpers(const RenderRequest& req) {
+    // only pages that take long enough for the extra threads to pay off
+    const float min_ms_for_bands = 25.0f;
+    float estimate = estimate_render_ms(req);
+    if (estimate < min_ms_for_bands) {
+        return 0;
+    }
+    const int max_helpers = 3;
+    std::lock_guard<std::mutex> lock(band_helpers_mutex);
+    // workers that are rendering (including this one) and helpers of other renders occupy cores
+    int available = band_cores - rendering_workers.load() - band_helpers_in_use;
+    int take = std::max(0, std::min(available, max_helpers));
+    band_helpers_in_use += take;
+    return take;
+}
+
+void PdfRenderer::release_band_helpers(int helpers) {
+    if (helpers > 0) {
+        std::lock_guard<std::mutex> lock(band_helpers_mutex);
+        band_helpers_in_use -= helpers;
+    }
+}
+
+void PdfRenderer::update_render_cost_estimate(const std::wstring& path, fz_pixmap* pixmap, float elapsed_ms, int bands) {
+    float megapixels = (float)pixmap->w * pixmap->h / 1e6f;
+    if (megapixels <= 0) return;
+    // what the render would have taken on one thread (a banded render doesn't scale perfectly, so
+    // this overestimates a little, which is fine for deciding whether to use bands)
+    float single_thread_ms = elapsed_ms * bands;
+    float ms_per_megapixel = single_thread_ms / megapixels;
+
+    std::lock_guard<std::mutex> lock(render_cost_mutex);
+    auto it = render_ms_per_megapixel.find(path);
+    if (it == render_ms_per_megapixel.end()) {
+        render_ms_per_megapixel[path] = ms_per_megapixel;
+    }
+    else {
+        // follow the document's recent pages
+        it->second = 0.5f * it->second + 0.5f * ms_per_megapixel;
+    }
 }

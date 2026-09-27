@@ -4,6 +4,7 @@
 #include <string>
 #include <mupdf/fitz.h>
 #include <mutex>
+#include <atomic>
 #include <variant>
 #include <unordered_map>
 #include <map>
@@ -57,6 +58,14 @@ struct RenderResponse {
 
 bool operator==(const RenderRequest& lhs, const RenderRequest& rhs);
 
+// Rasterizes the page (or page slice) described by `req`. Called from the render worker threads.
+// With helper_threads > 0 the page may be rasterized in horizontal bands by that many extra threads
+// (not if it's mostly an image), `bands_used` is set to the number of bands it was drawn in.
+fz_pixmap* render_request_pixmap(fz_context* ctx, fz_document* doc, const RenderRequest& req, int helper_threads = 0, int* bands_used = nullptr);
+
+// Uploads a rendered pixmap into a new OpenGL texture. Must be called from the thread that owns the GL context.
+GLuint create_texture_from_pixmap(fz_pixmap* pixmap);
+
 class PdfRenderer : public QObject {
     Q_OBJECT
         // A pointer to the mupdf context to clone.
@@ -95,6 +104,19 @@ class PdfRenderer : public QObject {
     bool are_documents_invalidated = false;
 
     int num_threads = 0;
+
+    // cores that can be used to render (worker threads and helpers rendering bands of heavy pages)
+    int band_cores = 0;
+    std::atomic<int> rendering_workers{ 0 };
+    std::mutex band_helpers_mutex;
+    int band_helpers_in_use = 0;
+    // running estimate of how long rendering a megapixel takes in each document
+    std::mutex render_cost_mutex;
+    std::map<std::wstring, float> render_ms_per_megapixel;
+    float estimate_render_ms(const RenderRequest& req);
+    int acquire_band_helpers(const RenderRequest& req);
+    void release_band_helpers(int helpers);
+    void update_render_cost_estimate(const std::wstring& path, fz_pixmap* pixmap, float elapsed_ms, int bands);
 
     std::map<std::wstring, std::string> document_passwords;
 
