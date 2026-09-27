@@ -12,7 +12,12 @@ echo "MAKE_PARALLEL set to $MAKE_PARALLEL"
 
 cd mupdf
 #make USE_SYSTEM_HARFBUZZ=yes USE_SYSTEM_GLUT=yes SYS_GLUT_CFLAGS="${sys_glut_clfags}" SYS_GLUT_LIBS="${sys_glut_libs}" SYS_HARFBUZZ_CFLAGS="${sys_harfbuzz_clfags}" SYS_HARFBUZZ_LIBS="${sys_harfbuzz_libs}" -j 4
-make HAVE_GLUT=no -j$MAKE_PARALLEL
+# mupdf is built with -O3 and as LTO bitcode, so it's optimized together with sioyek at link time.
+# The bitcode must be readable by the toolchain that links sioyek: when building sioyek with another
+# compiler than Xcode's (e.g. Homebrew LLVM), pass the same one for mupdf, e.g.
+#   MUPDF_TOOLCHAIN="CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ AR=/opt/homebrew/opt/llvm/bin/llvm-ar RANLIB=/opt/homebrew/opt/llvm/bin/llvm-ranlib"
+# (mupdf's makefile doesn't notice changed flags, run `make clean` in mupdf/ after changing them)
+make HAVE_GLUT=no XCFLAGS="-O3 -flto" $MUPDF_TOOLCHAIN -j$MAKE_PARALLEL
 cd ..
 
 sed -Ei '' "s/QMAKE_MACOSX_DEPLOYMENT_TARGET.=.[0-9]+/QMAKE_MACOSX_DEPLOYMENT_TARGET = $(sw_vers -productVersion | cut -d. -f1)/" pdf_viewer_build_config.pro
