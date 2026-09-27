@@ -30,6 +30,7 @@ private:
     bool create_bookmarks_table();
     bool create_links_table();
     void create_tables();
+    void create_indices();
     bool create_document_hash_table();
     bool create_highlights_table();
 public:

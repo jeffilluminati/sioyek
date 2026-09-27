@@ -1725,6 +1725,35 @@ void DatabaseManager::ensure_schema_compatibility() {
 
         set_version();
     }
+
+    // run after the migrations, older databases don't have all of the indexed columns
+    create_indices();
+}
+
+void DatabaseManager::create_indices() {
+    std::lock_guard<std::recursive_mutex> lock(db_mutex);
+    // Annotations are loaded by document whenever a document is opened, and edited/deleted by uuid.
+    // Without these indices all of those queries scan whole tables, so they got proportionally slower
+    // with every annotated document in the database (~20ms each with 2000 annotated documents).
+    // (marks already has an index on document_path because of UNIQUE(document_path, symbol), and
+    // opened_books and document_hash on path.)
+    const char* global_indices_sql =
+        "CREATE INDEX IF NOT EXISTS bookmarks_document_path ON bookmarks(document_path);"
+        "CREATE INDEX IF NOT EXISTS highlights_document_path ON highlights(document_path);"
+        "CREATE INDEX IF NOT EXISTS links_src_document ON links(src_document);"
+        "CREATE INDEX IF NOT EXISTS marks_uuid ON marks(uuid);"
+        "CREATE INDEX IF NOT EXISTS bookmarks_uuid ON bookmarks(uuid);"
+        "CREATE INDEX IF NOT EXISTS highlights_uuid ON highlights(uuid);"
+        "CREATE INDEX IF NOT EXISTS links_uuid ON links(uuid);";
+
+    char* error_message = nullptr;
+    int error_code = sqlite3_exec(global_db, global_indices_sql, null_callback, 0, &error_message);
+    handle_error("create_indices", error_code, error_message);
+
+    const char* local_indices_sql = "CREATE INDEX IF NOT EXISTS document_hash_hash ON document_hash(hash);";
+    error_message = nullptr;
+    error_code = sqlite3_exec(local_db, local_indices_sql, null_callback, 0, &error_message);
+    handle_error("create_indices", error_code, error_message);
 }
 
 bool DatabaseManager::run_schema_query(const char* query) {
