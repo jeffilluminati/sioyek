@@ -20,14 +20,17 @@ cd mupdf
 # (mupdf's makefile doesn't notice changed flags, run `make clean` in mupdf/ after changing them)
 # JPEG images are decoded with libjpeg-turbo (SIMD, `brew install jpeg-turbo`) when it is
 # installed, otherwise with mupdf's bundled libjpeg. pdf_viewer_build_config.pro links the same
-# static library. (After installing or removing it, run `make clean` in mupdf/ once.)
+# static library into sioyek, SYS_LIBJPEG_LIBS is for mupdf's own tools. (After installing or
+# removing it, run `make clean` in mupdf/ once.)
 MUPDF_JPEG=""
 for prefix in /opt/homebrew/opt/jpeg-turbo /usr/local/opt/jpeg-turbo; do
 	if [ -z "$MUPDF_JPEG" ] && [ -f "$prefix/lib/libjpeg.a" ]; then
-		MUPDF_JPEG="USE_SYSTEM_LIBJPEG=yes SYS_LIBJPEG_CFLAGS=-I$prefix/include SYS_LIBJPEG_LIBS="
+		MUPDF_JPEG="USE_SYSTEM_LIBJPEG=yes SYS_LIBJPEG_CFLAGS=-I$prefix/include SYS_LIBJPEG_LIBS=$prefix/lib/libjpeg.a"
 	fi
 done
-make HAVE_GLUT=no XCFLAGS="-O3 -flto" $MUPDF_TOOLCHAIN $MUPDF_JPEG -j$MAKE_PARALLEL
+# Flate streams (every page's content, many images) are inflated with macOS's zlib, which is about
+# twice as fast as mupdf's bundled copy on Apple silicon. sioyek links it anyway.
+make HAVE_GLUT=no USE_SYSTEM_ZLIB=yes XCFLAGS="-O3 -flto" $MUPDF_TOOLCHAIN $MUPDF_JPEG -j$MAKE_PARALLEL
 cd ..
 
 sed -Ei '' "s/QMAKE_MACOSX_DEPLOYMENT_TARGET.=.[0-9]+/QMAKE_MACOSX_DEPLOYMENT_TARGET = $(sw_vers -productVersion | cut -d. -f1)/" pdf_viewer_build_config.pro
