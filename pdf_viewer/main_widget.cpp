@@ -289,6 +289,7 @@ const int MAX_SCROLLBAR = 10000;
 extern int RELOAD_INTERVAL_MILISECONDS;
 
 const unsigned int INTERVAL_TIME = 200;
+const int MENU_BAR_DELAY_MS = 300;
 
 #ifdef Q_OS_MACOS
 extern float MACOS_TITLEBAR_COLOR[3];
@@ -1366,9 +1367,14 @@ MainWidget::MainWidget(fz_context* mupdf_context,
     if (MACOS_HIDE_TITLEBAR) {
         hideWindowTitleBar(winId());
     }
-    menu_bar = create_main_menu_bar();
-    setMenuBar(menu_bar);
-    menu_bar->stackUnder(text_command_line_edit_container);
+    // The menu bar is made once the window is up: making it first creates the native window, which
+    // then isn't created along with everything else when the window is shown, and delays the first
+    // page by ~50ms. (Only the native menu bar is affected, the key bindings don't depend on it.)
+    QTimer::singleShot(MENU_BAR_DELAY_MS, this, [this]() {
+        menu_bar = create_main_menu_bar();
+        setMenuBar(menu_bar);
+        menu_bar->stackUnder(text_command_line_edit_container);
+        });
 #endif
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
