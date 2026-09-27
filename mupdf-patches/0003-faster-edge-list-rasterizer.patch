@@ -1,0 +1,797 @@
+Faster scan conversion of paths (the edge list rasterizer), for vector heavy pages.
+
+- The active edge list holds copies of the edges instead of pointers into the global edge list,
+  and stays nearly sorted (edges that end are removed in place), so it is sorted by an insertion
+  sort only when edges crossed; new edges are merged in.
+- For the usual one-subscanline steps, spans are added and edges advanced in one pass, adding
+  each span as the sum of two points so the loop doesn't branch on where spans start and end.
+- The division by the horizontal subsampling is by a constant for the default antialiasing level.
+- Scanlines are converted and painted only where the deltas were touched, skipping runs of zero
+  coverage, which painting would leave unchanged.
+- The global edge list is sorted with a radix sort.
+
+The coverage computed for every pixel is the same, so the rendered output is unchanged.
+
+diff --git a/source/fitz/draw-edge.c b/source/fitz/draw-edge.c
+index 1c64d576e..6fa4f3272 100644
+--- a/source/fitz/draw-edge.c
++++ b/source/fitz/draw-edge.c
+@@ -45,16 +45,34 @@ typedef struct fz_edge_s
+ 	int xdir, ydir; /* -1 or +1 */
+ } fz_edge;
+ 
++/* An edge in the active list. The active list holds copies of the edges,
++ * rather than pointers into the global edge list, so that sweeping it
++ * reads contiguous memory. */
++typedef struct fz_active_edge_s
++{
++	int x, e, h;
++	int adj_up, adj_down;
++	int xmove;
++	int xdir, ydir;
++} fz_active_edge;
++
+ typedef struct fz_gel_s
+ {
+ 	fz_rasterizer super;
+ 	int cap, len;
+ 	fz_edge *edges;
+ 	int acap, alen;
+-	fz_edge **active;
++	fz_active_edge *active;
++	/* set when advancing the edges may have left the active list out of order */
++	int unsorted;
++	/* spare edge list for sort_gel */
++	int scap;
++	fz_edge *spare;
+ 	int bcap;
+ 	unsigned char *alphas;
+ 	int *deltas;
++	/* deltas[dirty0..dirty1) may be non zero, all others are zero */
++	int dirty0, dirty1;
+ } fz_gel;
+ 
+ static int
+@@ -64,6 +82,7 @@ fz_reset_gel(fz_context *ctx, fz_rasterizer *rast)
+ 
+ 	gel->len = 0;
+ 	gel->alen = 0;
++	gel->unsorted = 0;
+ 
+ 	return 0;
+ }
+@@ -76,6 +95,7 @@ fz_drop_gel(fz_context *ctx, fz_rasterizer *rast)
+ 		return;
+ 	fz_free(ctx, gel->active);
+ 	fz_free(ctx, gel->edges);
++	fz_free(ctx, gel->spare);
+ 	fz_free(ctx, gel->alphas);
+ 	fz_free(ctx, gel->deltas);
+ 	fz_free(ctx, gel);
+@@ -276,12 +296,63 @@ fz_insert_gel_rect(fz_context *ctx, fz_rasterizer *ras, float fx0, float fy0, fl
+ 	fz_insert_gel_raw(ctx, ras, x0, y1, x0, y0);
+ }
+ 
+-static int
+-cmpedge(const void *va, const void *vb)
++/* Sorts the edges by y with a least significant digit radix sort on
++ * y - ymin, a byte at a time. Only the order by y matters: edges with the
++ * same y are sorted by x when they become active. */
++static void
++sort_gel_radix(fz_context *ctx, fz_gel *gel)
+ {
+-	const fz_edge *a = va;
+-	const fz_edge *b = vb;
+-	return a->y - b->y;
++	int n = gel->len;
++	fz_edge *src, *dst, *tmp;
++	unsigned int range;
++	int ymin, ymax;
++	int i, shift;
++
++	if (gel->scap < gel->cap)
++	{
++		fz_free(ctx, gel->spare);
++		gel->spare = NULL;
++		gel->spare = Memento_label(fz_malloc_array(ctx, gel->cap, fz_edge), "gel_spare");
++		gel->scap = gel->cap;
++	}
++
++	ymin = ymax = gel->edges[0].y;
++	for (i = 1; i < n; i++)
++	{
++		ymin = fz_mini(ymin, gel->edges[i].y);
++		ymax = fz_maxi(ymax, gel->edges[i].y);
++	}
++	range = (unsigned int)ymax - (unsigned int)ymin;
++
++	src = gel->edges;
++	dst = gel->spare;
++	for (shift = 0; shift < 32 && (range >> shift) != 0; shift += 8)
++	{
++		int count[256] = { 0 };
++		int pos = 0;
++		for (i = 0; i < n; i++)
++			count[(((unsigned int)src[i].y - (unsigned int)ymin) >> shift) & 255]++;
++		for (i = 0; i < 256; i++)
++		{
++			int c = count[i];
++			count[i] = pos;
++			pos += c;
++		}
++		for (i = 0; i < n; i++)
++			dst[count[(((unsigned int)src[i].y - (unsigned int)ymin) >> shift) & 255]++] = src[i];
++		tmp = src;
++		src = dst;
++		dst = tmp;
++	}
++
++	if (src != gel->edges)
++	{
++		int cap = gel->cap;
++		gel->spare = gel->edges;
++		gel->edges = src;
++		gel->cap = gel->scap;
++		gel->scap = cap;
++	}
+ }
+ 
+ static void
+@@ -292,10 +363,10 @@ sort_gel(fz_context *ctx, fz_gel *gel)
+ 	int h, i, k;
+ 	fz_edge t;
+ 
+-	/* quick sort for long lists */
+-	if (n > 10000)
++	/* radix sort for long lists */
++	if (n > 64)
+ 	{
+-		qsort(a, n, sizeof *a, cmpedge);
++		sort_gel_radix(ctx, gel);
+ 		return;
+ 	}
+ 
+@@ -347,36 +418,36 @@ fz_is_rect_gel(fz_context *ctx, fz_rasterizer *ras)
+  * Active Edge List -- keep track of active edges while sweeping
+  */
+ 
+-static void
+-sort_active(fz_edge **a, int n)
++static int
++cmpedge_x(const void *va, const void *vb)
+ {
+-	int h, i, k;
+-	fz_edge *t;
++	const fz_edge *a = va;
++	const fz_edge *b = vb;
++	return a->x - b->x;
++}
+ 
+-	h = 1;
+-	if (n < 14) {
+-		h = 1;
+-	}
+-	else {
+-		while (h < n)
+-			h = 3 * h + 1;
+-		h /= 3;
+-		h /= 3;
+-	}
++/* The active list is sorted by x when the spans are made. Advancing the
++ * edges moves them by small amounts, so it is nearly sorted again when we
++ * get here: an insertion sort only has to swap the few edges that crossed. */
++static void
++sort_active(fz_active_edge *a, int n)
++{
++	int i, k;
++	fz_active_edge t;
+ 
+-	while (h > 0)
++	for (i = 1; i < n; i++)
+ 	{
+-		for (i = 0; i < n; i++) {
+-			t = a[i];
+-			k = i - h;
+-			while (k >= 0 && a[k]->x > t->x) {
+-				a[k + h] = a[k];
+-				k -= h;
+-			}
+-			a[k + h] = t;
++		if (a[i].x >= a[i - 1].x)
++			continue;
++		t = a[i];
++		k = i - 1;
++		do
++		{
++			a[k + 1] = a[k];
++			k--;
+ 		}
+-
+-		h /= 3;
++		while (k >= 0 && a[k].x > t.x);
++		a[k + 1] = t;
+ 	}
+ }
+ 
+@@ -385,73 +456,133 @@ insert_active(fz_context *ctx, fz_gel *gel, int y, int *e_)
+ {
+ 	int h_min = INT_MAX;
+ 	int e = *e_;
++	int i;
++
++	if (gel->unsorted)
++	{
++		sort_active(gel->active, gel->alen);
++		gel->unsorted = 0;
++	}
+ 
+ 	/* insert edges that start here */
+ 	if (e < gel->len && gel->edges[e].y == y)
+ 	{
+-		do {
+-			if (gel->alen + 1 == gel->acap) {
+-				int newcap = gel->acap + 64;
+-				fz_edge **newactive = fz_realloc_array(ctx, gel->active, newcap, fz_edge*);
+-				gel->active = newactive;
+-				gel->acap = newcap;
+-			}
+-			gel->active[gel->alen++] = &gel->edges[e++];
+-		} while (e < gel->len && gel->edges[e].y == y);
++		fz_edge *first = &gel->edges[e];
++		fz_active_edge *a;
++		int k, n, w;
++
++		do
++			e++;
++		while (e < gel->len && gel->edges[e].y == y);
+ 		*e_ = e;
++		n = e - (int)(first - gel->edges);
++
++		if (gel->alen + n + 1 > gel->acap)
++		{
++			int newcap = gel->alen + n + 64;
++			gel->active = fz_realloc_array(ctx, gel->active, newcap, fz_active_edge);
++			gel->acap = newcap;
++		}
++
++		/* The new edges all start on this row, so reordering them among
++		 * themselves keeps the edge list sorted by y. Sort them by x and
++		 * merge them into the active list from the back. */
++		if (n > 1)
++		{
++			if (n < 32)
++			{
++				for (k = 1; k < n; k++)
++				{
++					fz_edge t = first[k];
++					int j = k - 1;
++					while (j >= 0 && first[j].x > t.x)
++					{
++						first[j + 1] = first[j];
++						j--;
++					}
++					first[j + 1] = t;
++				}
++			}
++			else
++				qsort(first, n, sizeof *first, cmpedge_x);
++		}
++
++		a = gel->active;
++		i = gel->alen - 1;
++		k = n - 1;
++		w = gel->alen + n - 1;
++		while (k >= 0)
++		{
++			if (i >= 0 && a[i].x > first[k].x)
++				a[w--] = a[i--];
++			else
++			{
++				fz_edge *src = &first[k--];
++				a[w].x = src->x;
++				a[w].e = src->e;
++				a[w].h = src->h;
++				a[w].adj_up = src->adj_up;
++				a[w].adj_down = src->adj_down;
++				a[w].xmove = src->xmove;
++				a[w].xdir = src->xdir;
++				a[w].ydir = src->ydir;
++				w--;
++			}
++		}
++		gel->alen += n;
+ 	}
+ 
+ 	if (e < gel->len)
+ 		h_min = gel->edges[e].y - y;
+ 
+-	for (e=0; e < gel->alen; e++)
++	for (i = 0; i < gel->alen; i++)
+ 	{
+-		if (gel->active[e]->xmove != 0 || gel->active[e]->adj_up != 0)
++		if (gel->active[i].xmove != 0 || gel->active[i].adj_up != 0)
+ 		{
+ 			h_min = 1;
+ 			break;
+ 		}
+-		if (gel->active[e]->h < h_min)
++		if (gel->active[i].h < h_min)
+ 		{
+-			h_min = gel->active[e]->h;
++			h_min = gel->active[i].h;
+ 			if (h_min == 1)
+ 				break;
+ 		}
+ 	}
+ 
+-	/* shell-sort the edges by increasing x */
+-	sort_active(gel->active, gel->alen);
+-
+ 	return h_min;
+ }
+ 
++/* Edges that end are removed without reordering the others, which keeps the
++ * list nearly sorted for sort_active. */
+ static void
+ advance_active(fz_context *ctx, fz_gel *gel, int inc)
+ {
+-	fz_edge *edge;
+-	int i = 0;
++	fz_active_edge *a = gel->active;
++	int n = gel->alen;
++	int prev_x = INT_MIN;
++	int unsorted = 0;
++	int i, j = 0;
+ 
+-	while (i < gel->alen)
++	for (i = 0; i < n; i++)
+ 	{
+-		edge = gel->active[i];
+-
+-		edge->h -= inc;
+-
+-		/* terminator! */
+-		if (edge->h == 0) {
+-			gel->active[i] = gel->active[--gel->alen];
+-		}
+-
+-		else {
+-			edge->x += edge->xmove;
+-			edge->e += edge->adj_up;
+-			if (edge->e > 0) {
+-				edge->x += edge->xdir;
+-				edge->e -= edge->adj_down;
+-			}
+-			i ++;
+-		}
++		fz_active_edge edge = a[i];
++		int over;
++		edge.h -= inc;
++		if (edge.h == 0)
++			continue;
++		edge.x += edge.xmove;
++		edge.e += edge.adj_up;
++		over = edge.e > 0;
++		edge.x += over ? edge.xdir : 0;
++		edge.e -= over ? edge.adj_down : 0;
++		unsorted |= edge.x < prev_x;
++		prev_x = edge.x;
++		a[j++] = edge;
+ 	}
++
++	gel->alen = j;
++	gel->unsorted |= unsorted;
+ }
+ 
+ /*
+@@ -459,11 +590,10 @@ advance_active(fz_context *ctx, fz_gel *gel, int inc)
+  */
+ 
+ static inline void
+-add_span_aa(fz_context *ctx, fz_gel *gel, int *list, int x0, int x1, int xofs, int h)
++add_span_aa(fz_context *ctx, fz_gel *gel, int *list, int x0, int x1, int xofs, int h, int *dirty0, int *dirty1, const int hscale)
+ {
+ 	int x0pix, x0sub;
+ 	int x1pix, x1sub;
+-	const int hscale = fz_rasterizer_aa_hscale(&gel->super);
+ 
+ 	if (x0 == x1)
+ 		return;
+@@ -493,53 +623,172 @@ add_span_aa(fz_context *ctx, fz_gel *gel, int *list, int x0, int x1, int xofs, i
+ 		list[x1pix] += h*(x1sub - hscale);
+ 		list[x1pix+1] += h*-x1sub;
+ 	}
++
++	*dirty0 = fz_mini(*dirty0, fz_mini(x0pix, x1pix));
++	*dirty1 = fz_maxi(*dirty1, fz_maxi(x0pix, x1pix) + 2);
+ }
+ 
+ static inline void
+-non_zero_winding_aa(fz_context *ctx, fz_gel *gel, int *list, int xofs, int h)
++non_zero_winding_aa(fz_context *ctx, fz_gel *gel, int *list, int xofs, int h, const int hscale)
+ {
++	const fz_active_edge *a = gel->active;
++	int n = gel->alen;
++	int dirty0 = gel->dirty0, dirty1 = gel->dirty1;
+ 	int winding = 0;
+ 	int x = 0;
+ 	int i;
+ 
+-	for (i = 0; i < gel->alen; i++)
++	for (i = 0; i < n; i++)
+ 	{
+-		if (!winding && (winding + gel->active[i]->ydir))
+-			x = gel->active[i]->x;
+-		if (winding && !(winding + gel->active[i]->ydir))
+-			add_span_aa(ctx, gel, list, x, gel->active[i]->x, xofs, h);
+-		winding += gel->active[i]->ydir;
++		if (!winding && (winding + a[i].ydir))
++			x = a[i].x;
++		if (winding && !(winding + a[i].ydir))
++			add_span_aa(ctx, gel, list, x, a[i].x, xofs, h, &dirty0, &dirty1, hscale);
++		winding += a[i].ydir;
+ 	}
++
++	gel->dirty0 = dirty0;
++	gel->dirty1 = dirty1;
+ }
+ 
+ static inline void
+-even_odd_aa(fz_context *ctx, fz_gel *gel, int *list, int xofs, int h)
++even_odd_aa(fz_context *ctx, fz_gel *gel, int *list, int xofs, int h, const int hscale)
+ {
++	const fz_active_edge *a = gel->active;
++	int n = gel->alen;
++	int dirty0 = gel->dirty0, dirty1 = gel->dirty1;
+ 	int even = 0;
+ 	int x = 0;
+ 	int i;
+ 
+-	for (i = 0; i < gel->alen; i++)
++	for (i = 0; i < n; i++)
+ 	{
+ 		if (!even)
+-			x = gel->active[i]->x;
++			x = a[i].x;
+ 		else
+-			add_span_aa(ctx, gel, list, x, gel->active[i]->x, xofs, h);
++			add_span_aa(ctx, gel, list, x, a[i].x, xofs, h, &dirty0, &dirty1, hscale);
+ 		even = !even;
+ 	}
++
++	gel->dirty0 = dirty0;
++	gel->dirty1 = dirty1;
++}
++
++/* The usual case: when any active edge is not vertical, each subscanline is
++ * handled on its own. This adds its spans (like non_zero_winding_aa or
++ * even_odd_aa with h = 1) and advances the edges by one subscanline (like
++ * advance_active) in a single pass over the active list.
++ *
++ * add_span_aa(x0, x1) adds the same deltas as adding a point at x0 and
++ * subtracting one at x1 (see add_point_aa). So rather than branching on
++ * where the spans start and end, which depends on the shape and is hard to
++ * predict, every edge adds its point with a weight of +1 (a span starts
++ * here), -1 (a span ends here) or 0. The deltas come out identical. */
++static inline void
++add_point_aa(int *list, int x, int xofs, int s, const int hscale)
++{
++	unsigned int xr = (unsigned int)(x - xofs);
++	int xpix = xr / hscale;
++	int xsub = xr % hscale;
++	list[xpix] += s * (hscale - xsub);
++	list[xpix + 1] += s * xsub;
++}
++
++static inline void
++spans_and_advance_aa(fz_context *ctx, fz_gel *gel, int *list, int xofs, int eofill, const int hscale)
++{
++	fz_active_edge *a = gel->active;
++	int n = gel->alen;
++	int winding = 0;
++	int last_start = 0;
++	int prev_x = INT_MIN;
++	int unsorted = 0;
++	int i, j = 0;
++
++	if (n == 0)
++		return;
++
++	/* The list is sorted by x, so all the points are between its ends. */
++	gel->dirty0 = fz_mini(gel->dirty0, (int)((unsigned int)(a[0].x - xofs) / hscale));
++	gel->dirty1 = fz_maxi(gel->dirty1, (int)((unsigned int)(a[n - 1].x - xofs) / hscale) + 2);
++
++	for (i = 0; i < n; i++)
++	{
++		fz_active_edge edge = a[i];
++		int s, over;
++
++		if (eofill)
++			s = (i & 1) ? -1 : 1;
++		else
++		{
++			int was_zero = winding == 0;
++			winding += edge.ydir;
++			s = was_zero - (winding == 0);
++		}
++		last_start = s > 0 ? edge.x : last_start;
++		add_point_aa(list, edge.x, xofs, s, hscale);
++
++		edge.h -= 1;
++		if (edge.h == 0)
++			continue;
++		edge.x += edge.xmove;
++		edge.e += edge.adj_up;
++		over = edge.e > 0;
++		edge.x += over ? edge.xdir : 0;
++		edge.e -= over ? edge.adj_down : 0;
++		unsorted |= edge.x < prev_x;
++		prev_x = edge.x;
++		a[j++] = edge;
++	}
++
++	/* A span that isn't closed by a later edge isn't drawn. */
++	if (eofill ? (n & 1) : winding != 0)
++		add_point_aa(list, last_start, xofs, -1, hscale);
++
++	gel->alen = j;
++	gel->unsorted |= unsorted;
+ }
+ 
++/* Turns the deltas of a scanline into alphas. Only deltas[dirty0..dirty1)
++ * can be non zero, outside of that the alphas are zero and are not written.
++ * The range of the clipped scanline that may have non zero alphas is
++ * returned in [*x0, *x1). */
+ static inline void
+-undelta_aa(fz_context *ctx, unsigned char * FZ_RESTRICT out, int * FZ_RESTRICT in, int n, int scale)
++undelta_aa(fz_context *ctx, fz_gel *gel, int skipx, int clipn, int scale, int *x0_, int *x1_)
+ {
++	unsigned char * FZ_RESTRICT out = gel->alphas;
++	const int * FZ_RESTRICT in = gel->deltas;
++	int x0 = fz_maxi(gel->dirty0, skipx);
++	int x1 = fz_mini(gel->dirty1, skipx + clipn);
+ 	int d = 0;
++	int i;
+ 	(void)scale; /* Avoid warnings in some builds */
+ 
+-	while (n--)
++	if (x0 >= x1)
+ 	{
+-		d += *in++;
+-		*out++ = AA_SCALE(scale, d);
++		*x0_ = *x1_ = 0;
++		return;
+ 	}
++
++	for (i = gel->dirty0; i < x0; i++)
++		d += in[i];
++	for (; i < x1; i++)
++	{
++		d += in[i];
++		out[i] = AA_SCALE(scale, d);
++	}
++
++	*x0_ = x0;
++	*x1_ = x1;
++}
++
++static inline void
++clear_deltas_aa(fz_gel *gel)
++{
++	if (gel->dirty0 < gel->dirty1)
++		memset(gel->deltas + gel->dirty0, 0, (gel->dirty1 - gel->dirty0) * sizeof(int));
++	gel->dirty0 = INT_MAX;
++	gel->dirty1 = 0;
+ }
+ 
+ static inline void
+@@ -553,8 +802,46 @@ blit_aa(fz_pixmap *dst, int x, int y, unsigned char *mp, int w, unsigned char *c
+ 		(*(fz_span_painter_t *)fn)(dp, dst->alpha, mp, 1, 0, w, 255, eop);
+ }
+ 
++/* Paints alphas[x0..x1) at pixel xmin + x0 onwards. Painting a zero alpha
++ * leaves the destination as it is, so runs of zeros (the space between the
++ * shapes of a path) are skipped. Short gaps are painted over rather than
++ * split into more painter calls. */
+ static void
+-fz_scan_convert_aa(fz_context *ctx, fz_gel *gel, int eofill, const fz_irect *clip, fz_pixmap *dst, unsigned char *color, void *painter, fz_overprint *eop)
++blit_aa_runs(fz_pixmap *dst, int xmin, int y, unsigned char *alphas, int x0, int x1, unsigned char *color, void *fn, fz_overprint *eop)
++{
++	int i = x0;
++	for (;;)
++	{
++		int start, end;
++		while (i + 8 <= x1)
++		{
++			uint64_t word;
++			memcpy(&word, alphas + i, sizeof word);
++			if (word != 0)
++				break;
++			i += 8;
++		}
++		while (i < x1 && alphas[i] == 0)
++			i++;
++		if (i >= x1)
++			return;
++		start = i;
++		for (;;)
++		{
++			while (i < x1 && alphas[i] != 0)
++				i++;
++			end = i;
++			while (i < x1 && alphas[i] == 0 && i - end < 16)
++				i++;
++			if (i >= x1 || alphas[i] == 0)
++				break;
++		}
++		blit_aa(dst, xmin + start, y, alphas + start, end - start, color, fn, eop);
++	}
++}
++
++static fz_forceinline void
++fz_scan_convert_aa_imp(fz_context *ctx, fz_gel *gel, int eofill, const fz_irect *clip, fz_pixmap *dst, unsigned char *color, void *painter, fz_overprint *eop, const int hscale)
+ {
+ 	unsigned char *alphas;
+ 	int *deltas;
+@@ -562,7 +849,7 @@ fz_scan_convert_aa(fz_context *ctx, fz_gel *gel, int eofill, const fz_irect *cli
+ 	int yd, yc;
+ 	int height, h0, rh;
+ 	int bcap;
+-	const int hscale = fz_rasterizer_aa_hscale(&gel->super);
++	int ax0, ax1;
+ 	const int vscale = fz_rasterizer_aa_vscale(&gel->super);
+ 	const int scale = fz_rasterizer_aa_scale(&gel->super);
+ 
+@@ -596,6 +883,8 @@ fz_scan_convert_aa(fz_context *ctx, fz_gel *gel, int eofill, const fz_irect *cli
+ 	deltas = gel->deltas;
+ 
+ 	memset(deltas, 0, (xmax - xmin + 1) * sizeof(int));
++	gel->dirty0 = INT_MAX;
++	gel->dirty1 = 0;
+ 	gel->alen = 0;
+ 
+ 	/* The theory here is that we have a list of the edges (gel) of length
+@@ -661,9 +950,9 @@ fz_scan_convert_aa(fz_context *ctx, fz_gel *gel, int eofill, const fz_irect *cli
+ 		rh = (yc+1)*vscale - y;
+ 		if (yc != yd)
+ 		{
+-			undelta_aa(ctx, alphas, deltas, skipx + clipn, scale);
+-			blit_aa(dst, xmin + skipx, yd, alphas + skipx, clipn, color, painter, eop);
+-			memset(deltas, 0, (skipx + clipn) * sizeof(int));
++			undelta_aa(ctx, gel, skipx, clipn, scale, &ax0, &ax1);
++			blit_aa_runs(dst, xmin, yd, alphas, ax0, ax1, color, painter, eop);
++			clear_deltas_aa(gel);
+ 		}
+ 		yd = yc;
+ 		if (yd >= clip->y1)
+@@ -681,12 +970,12 @@ fz_scan_convert_aa(fz_context *ctx, fz_gel *gel, int eofill, const fz_irect *cli
+ 				 * have more sub scanlines than will fit into
+ 				 * it. */
+ 				if (eofill)
+-					even_odd_aa(ctx, gel, deltas, xofs, rh);
++					even_odd_aa(ctx, gel, deltas, xofs, rh, hscale);
+ 				else
+-					non_zero_winding_aa(ctx, gel, deltas, xofs, rh);
+-				undelta_aa(ctx, alphas, deltas, skipx + clipn, scale);
+-				blit_aa(dst, xmin + skipx, yd, alphas + skipx, clipn, color, painter, eop);
+-				memset(deltas, 0, (skipx + clipn) * sizeof(int));
++					non_zero_winding_aa(ctx, gel, deltas, xofs, rh, hscale);
++				undelta_aa(ctx, gel, skipx, clipn, scale, &ax0, &ax1);
++				blit_aa_runs(dst, xmin, yd, alphas, ax0, ax1, color, painter, eop);
++				clear_deltas_aa(gel);
+ 				yd++;
+ 				if (yd >= clip->y1)
+ 					break;
+@@ -698,15 +987,15 @@ fz_scan_convert_aa(fz_context *ctx, fz_gel *gel, int eofill, const fz_irect *cli
+ 				 * scanlines. */
+ 				h0 -= vscale;
+ 				if (eofill)
+-					even_odd_aa(ctx, gel, deltas, xofs, vscale);
++					even_odd_aa(ctx, gel, deltas, xofs, vscale, hscale);
+ 				else
+-					non_zero_winding_aa(ctx, gel, deltas, xofs, vscale);
+-				undelta_aa(ctx, alphas, deltas, skipx + clipn, scale);
++					non_zero_winding_aa(ctx, gel, deltas, xofs, vscale, hscale);
++				undelta_aa(ctx, gel, skipx, clipn, scale, &ax0, &ax1);
+ 				do
+ 				{
+ 					/* Do any successive whole scanlines - no need
+ 					 * to recalculate deltas here. */
+-					blit_aa(dst, xmin + skipx, yd, alphas + skipx, clipn, color, painter, eop);
++					blit_aa_runs(dst, xmin, yd, alphas, ax0, ax1, color, painter, eop);
+ 					yd++;
+ 					if (yd >= clip->y1)
+ 						goto clip_ended;
+@@ -718,14 +1007,20 @@ fz_scan_convert_aa(fz_context *ctx, fz_gel *gel, int eofill, const fz_irect *cli
+ 				 * already. */
+ 				if (h0 == 0)
+ 					goto advance;
+-				memset(deltas, 0, (skipx + clipn) * sizeof(int));
++				clear_deltas_aa(gel);
+ 				h0 += vscale;
+ 			}
+ 		}
++		if (height == 1)
++		{
++			spans_and_advance_aa(ctx, gel, deltas, xofs, eofill, hscale);
++			y += 1;
++			continue;
++		}
+ 		if (eofill)
+-			even_odd_aa(ctx, gel, deltas, xofs, h0);
++			even_odd_aa(ctx, gel, deltas, xofs, h0, hscale);
+ 		else
+-			non_zero_winding_aa(ctx, gel, deltas, xofs, h0);
++			non_zero_winding_aa(ctx, gel, deltas, xofs, h0, hscale);
+ advance:
+ 		advance_active(ctx, gel, height);
+ 
+@@ -734,13 +1029,25 @@ advance:
+ 
+ 	if (yd < clip->y1)
+ 	{
+-		undelta_aa(ctx, alphas, deltas, skipx + clipn, scale);
+-		blit_aa(dst, xmin + skipx, yd, alphas + skipx, clipn, color, painter, eop);
++		undelta_aa(ctx, gel, skipx, clipn, scale, &ax0, &ax1);
++		blit_aa_runs(dst, xmin, yd, alphas, ax0, ax1, color, painter, eop);
+ 	}
+ clip_ended:
+ 	;
+ }
+ 
++static void
++fz_scan_convert_aa(fz_context *ctx, fz_gel *gel, int eofill, const fz_irect *clip, fz_pixmap *dst, unsigned char *color, void *painter, fz_overprint *eop)
++{
++	/* A constant hscale for the default level of antialiasing lets the
++	 * compiler turn the divisions in add_span_aa into multiplications. */
++	const int hscale = fz_rasterizer_aa_hscale(&gel->super);
++	if (hscale == 17)
++		fz_scan_convert_aa_imp(ctx, gel, eofill, clip, dst, color, painter, eop, 17);
++	else
++		fz_scan_convert_aa_imp(ctx, gel, eofill, clip, dst, color, painter, eop, hscale);
++}
++
+ /*
+  * Sharp (not anti-aliased) scan conversion
+  */
+@@ -770,11 +1077,11 @@ non_zero_winding_sharp(fz_context *ctx, fz_gel *gel, int y, const fz_irect *clip
+ 	int i;
+ 	for (i = 0; i < gel->alen; i++)
+ 	{
+-		if (!winding && (winding + gel->active[i]->ydir))
+-			x = gel->active[i]->x;
+-		if (winding && !(winding + gel->active[i]->ydir))
+-			blit_sharp(x, gel->active[i]->x, y, clip, dst, color, fn, eop);
+-		winding += gel->active[i]->ydir;
++		if (!winding && (winding + gel->active[i].ydir))
++			x = gel->active[i].x;
++		if (winding && !(winding + gel->active[i].ydir))
++			blit_sharp(x, gel->active[i].x, y, clip, dst, color, fn, eop);
++		winding += gel->active[i].ydir;
+ 	}
+ }
+ 
+@@ -787,9 +1094,9 @@ even_odd_sharp(fz_context *ctx, fz_gel *gel, int y, const fz_irect *clip, fz_pix
+ 	for (i = 0; i < gel->alen; i++)
+ 	{
+ 		if (!even)
+-			x = gel->active[i]->x;
++			x = gel->active[i].x;
+ 		else
+-			blit_sharp(x, gel->active[i]->x, y, clip, dst, color, fn, eop);
++			blit_sharp(x, gel->active[i].x, y, clip, dst, color, fn, eop);
+ 		even = !even;
+ 	}
+ }
+@@ -906,7 +1213,10 @@ fz_new_gel(fz_context *ctx)
+ 
+ 		gel->acap = 64;
+ 		gel->alen = 0;
+-		gel->active = Memento_label(fz_malloc_array(ctx, gel->acap, fz_edge*), "gel_active");
++		gel->unsorted = 0;
++		gel->scap = 0;
++		gel->spare = NULL;
++		gel->active = Memento_label(fz_malloc_array(ctx, gel->acap, fz_active_edge), "gel_active");
+ 	}
+ 	fz_catch(ctx)
+ 	{

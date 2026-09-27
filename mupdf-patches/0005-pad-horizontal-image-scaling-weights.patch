@@ -1,0 +1,181 @@
+Faster horizontal image scaling on platforms without the ARM assembly (e.g. arm64, x86): pad the
+horizontal weights of every output pixel with zero weights to the same length, as is already done
+for the vertical weights, so the loops no longer depend on how many source pixels each output pixel
+covers (a mispredicted branch per pixel) and unroll for the common lengths. Zero weights don't
+change the sums, so the scaled image is unchanged.
+
+diff --git a/source/fitz/draw-scale-simple.c b/source/fitz/draw-scale-simple.c
+--- a/source/fitz/draw-scale-simple.c
++++ b/source/fitz/draw-scale-simple.c
+@@ -452,6 +452,56 @@ window_fix(int l, int *rp, float window, float centre)
+ 	return l;
+ }
+ 
++#ifndef ARCH_ARM
++/* Value of new_line (which is only used while the weights are made) once
++ * pad_weights has given every output pixel max_len weights. */
++#define WEIGHTS_PADDED -1
++
++/* Pads the weights of every output pixel with zeros to the length of the
++ * longest (as reorder_weights does for vertical weights, without the
++ * reordering), moving the first source pixel back where the weights would
++ * run past the end of the row. Zero weights don't change the result, and
++ * the loops that scale a row no longer depend on how many source pixels
++ * each output pixel happens to cover. */
++static void
++pad_weights(fz_weights *weights, int src_w)
++{
++	int count = weights->count;
++	int base = weights->index[0];
++	int len_max = 0;
++	int j;
++
++	for (j = 0; j < count; j++)
++		len_max = fz_maxi(len_max, weights->index[weights->index[j] + 1]);
++	if (len_max == 0 || len_max > weights->max_len || len_max > src_w)
++		return;
++
++	/* Each record only grows, so moving them from the last one back never
++	 * overwrites a record that hasn't been moved yet. */
++	for (j = count - 1; j >= 0; j--)
++	{
++		int old = weights->index[j];
++		int min = weights->index[old];
++		int len = weights->index[old + 1];
++		int idx = base + j * (2 + len_max);
++		int off = 0;
++		if (min + len_max > src_w)
++		{
++			off = min + len_max - src_w;
++			min = src_w - len_max;
++		}
++		memmove(&weights->index[idx + 2 + off], &weights->index[old + 2], sizeof(int) * len);
++		memset(&weights->index[idx + 2], 0, sizeof(int) * off);
++		memset(&weights->index[idx + 2 + off + len], 0, sizeof(int) * (len_max - len - off));
++		weights->index[idx] = min;
++		weights->index[idx + 1] = len_max;
++		weights->index[j] = idx;
++	}
++	weights->max_len = len_max;
++	weights->new_line = WEIGHTS_PADDED;
++}
++#endif
++
+ static fz_weights *
+ make_weights(fz_context *ctx, int src_w, float x, float dst_w, fz_scale_filter *filter, int vertical, int dst_w_int, int patch_l, int patch_r, int n, int flip, fz_scale_cache *cache)
+ {
+@@ -540,6 +590,10 @@ make_weights(fz_context *ctx, int src_w, float x, float dst_w, fz_scale_filter *
+ 		}
+ 	}
+ 	weights->count++; /* weights->count = dst_w_int now */
++#ifndef ARCH_ARM
++	if (!vertical)
++		pad_weights(weights, src_w);
++#endif
+ 	if (cache)
+ 	{
+ 		cache->weights = weights;
+@@ -1058,6 +1112,55 @@ scale_row_from_temp_alpha(unsigned char * FZ_RESTRICT dst, const unsigned char *
+ }
+ #else
+ 
++/* Scales a row with weights made by pad_weights: every output pixel has
++ * len weights. With n and len constant the loops unroll completely. */
++static fz_forceinline void
++scale_row_to_temp_fixed(unsigned char * FZ_RESTRICT dst, const unsigned char * FZ_RESTRICT src, const int * FZ_RESTRICT contrib, int count, int flip, const int n, const int len)
++{
++	int step = n;
++	int i, j, k;
++
++	if (flip)
++	{
++		dst += (count - 1) * n;
++		step = -n;
++	}
++	for (i = count; i > 0; i--)
++	{
++		const unsigned char *s = &src[n * contrib[0]];
++		int acc[4] = { 128, 128, 128, 128 };
++		for (k = 0; k < len; k++)
++		{
++			int w = contrib[2 + k];
++			for (j = 0; j < n; j++)
++				acc[j] += s[n * k + j] * w;
++		}
++		for (j = 0; j < n; j++)
++			dst[j] = (unsigned char)(acc[j] >> 8);
++		dst += step;
++		contrib += 2 + len;
++	}
++}
++
++static fz_forceinline void
++scale_row_to_temp_padded(unsigned char * FZ_RESTRICT dst, const unsigned char * FZ_RESTRICT src, const fz_weights * FZ_RESTRICT weights, const int n)
++{
++	const int *contrib = &weights->index[weights->index[0]];
++	int count = weights->count;
++	int flip = weights->flip;
++
++	switch (weights->max_len)
++	{
++	case 1: scale_row_to_temp_fixed(dst, src, contrib, count, flip, n, 1); break;
++	case 2: scale_row_to_temp_fixed(dst, src, contrib, count, flip, n, 2); break;
++	case 3: scale_row_to_temp_fixed(dst, src, contrib, count, flip, n, 3); break;
++	case 4: scale_row_to_temp_fixed(dst, src, contrib, count, flip, n, 4); break;
++	case 5: scale_row_to_temp_fixed(dst, src, contrib, count, flip, n, 5); break;
++	case 6: scale_row_to_temp_fixed(dst, src, contrib, count, flip, n, 6); break;
++	default: scale_row_to_temp_fixed(dst, src, contrib, count, flip, n, weights->max_len); break;
++	}
++}
++
+ static void
+ scale_row_to_temp1(unsigned char * FZ_RESTRICT dst, const unsigned char * FZ_RESTRICT src, const fz_weights * FZ_RESTRICT weights)
+ {
+@@ -1066,6 +1169,11 @@ scale_row_to_temp1(unsigned char * FZ_RESTRICT dst, const unsigned char * FZ_RES
+ 	const unsigned char *min;
+ 
+ 	assert(weights->n == 1);
++	if (weights->new_line == WEIGHTS_PADDED)
++	{
++		scale_row_to_temp_padded(dst, src, weights, 1);
++		return;
++	}
+ 	if (weights->flip)
+ 	{
+ 		dst += weights->count;
+@@ -1105,6 +1213,11 @@ scale_row_to_temp2(unsigned char * FZ_RESTRICT dst, const unsigned char * FZ_RES
+ 	const unsigned char *min;
+ 
+ 	assert(weights->n == 2);
++	if (weights->new_line == WEIGHTS_PADDED)
++	{
++		scale_row_to_temp_padded(dst, src, weights, 2);
++		return;
++	}
+ 	if (weights->flip)
+ 	{
+ 		dst += 2*weights->count;
+@@ -1150,6 +1263,11 @@ scale_row_to_temp3(unsigned char * FZ_RESTRICT dst, const unsigned char * FZ_RES
+ 	const unsigned char *min;
+ 
+ 	assert(weights->n == 3);
++	if (weights->new_line == WEIGHTS_PADDED)
++	{
++		scale_row_to_temp_padded(dst, src, weights, 3);
++		return;
++	}
+ 	if (weights->flip)
+ 	{
+ 		dst += 3*weights->count;
+@@ -1203,6 +1321,11 @@ scale_row_to_temp4(unsigned char * FZ_RESTRICT dst, const unsigned char * FZ_RES
+ 	const unsigned char *min;
+ 
+ 	assert(weights->n == 4);
++	if (weights->new_line == WEIGHTS_PADDED)
++	{
++		scale_row_to_temp_padded(dst, src, weights, 4);
++		return;
++	}
+ 	if (weights->flip)
+ 	{
+ 		dst += 4*weights->count;

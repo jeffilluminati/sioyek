@@ -1,0 +1,59 @@
+Draw an opaque image that was already scaled to size (one source pixel per destination pixel) by
+copying its rows, instead of computing the source position and checking coverage per pixel. The
+same values are written.
+
+diff --git a/source/fitz/draw-affine.c b/source/fitz/draw-affine.c
+index 16a9d3105..426382adf 100644
+--- a/source/fitz/draw-affine.c
++++ b/source/fitz/draw-affine.c
+@@ -705,6 +705,26 @@ template_affine_N_near_fb0(byte * FZ_RESTRICT dp, int da, const byte * FZ_RESTRI
+ 	if (vi < 0 || vi >= sh)
+ 		return;
+ 	sp += vi * ss;
++	/* An opaque image that has already been scaled to size is drawn one
++	 * source pixel per destination pixel: then this is a copy of a run of
++	 * the source row (what the loop below does with a = 255). */
++	if (!sa && fa == ((affint)1 << PREC) && !hp && !gp && (u >> PREC) >= 0 && (u >> PREC) + w <= sw)
++	{
++		const byte *sample = sp + (u >> PREC) * sn1;
++		do
++		{
++			for (k = 0; k < sn1; k++)
++				dp[k] = sample[k];
++			for (k = sn1; k < dn1; k++)
++				dp[k] = 0;
++			if (da)
++				dp[dn1] = 255;
++			dp += dn1 + da;
++			sample += sn1;
++		}
++		while (--w);
++		return;
++	}
+ 	do
+ 	{
+ 		affint ui = u >> PREC;
+@@ -963,6 +983,23 @@ template_affine_solid_g2rgb_near_fb0(byte * FZ_RESTRICT dp, int da, const byte *
+ 	if (vi < 0 || vi >= sh)
+ 		return;
+ 	sp += vi * ss;
++	/* See template_affine_N_near_fb0 */
++	if (!sa && fa == ((affint)1 << PREC) && !hp && !gp && (u >> PREC) >= 0 && (u >> PREC) + w <= sw)
++	{
++		const byte *sample = sp + (u >> PREC);
++		do
++		{
++			int x = *sample++;
++			dp[0] = x;
++			dp[1] = x;
++			dp[2] = x;
++			if (da)
++				dp[3] = 255;
++			dp += 3 + da;
++		}
++		while (--w);
++		return;
++	}
+ 	do
+ 	{
+ 		affint ui = u >> PREC;

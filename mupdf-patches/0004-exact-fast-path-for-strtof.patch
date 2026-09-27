@@ -1,0 +1,39 @@
+Faster parsing of real numbers, which content streams are full of: when the mantissa and the
+power of ten are exact floats, one multiplication or division gives the correctly rounded result.
+An exhaustive comparison over that range (every mantissa below 2^24, exponents -12..12, both
+signs) shows it is bit for bit what the existing algorithm returns. fz_atof reads errno only
+when the result is 0.
+
+diff --git a/source/fitz/string.c b/source/fitz/string.c
+index beae6ee5c..da999263e 100644
+--- a/source/fitz/string.c
++++ b/source/fitz/string.c
+@@ -862,7 +862,7 @@ float fz_atof(const char *s)
+ 
+ 	errno = 0;
+ 	result = fz_strtof(s, NULL);
+-	if ((errno == ERANGE && result == 0) || isnan(result))
++	if ((result == 0 && errno == ERANGE) || isnan(result))
+ 		/* Return 1.0 on  underflow, as it's a small known value that won't cause a divide by 0.  */
+ 		return 1;
+ 	result = fz_clamp(result, -FLT_MAX, FLT_MAX);
+diff --git a/source/fitz/strtof.c b/source/fitz/strtof.c
+index f0b341692..03e85f7aa 100644
+--- a/source/fitz/strtof.c
++++ b/source/fitz/strtof.c
+@@ -290,6 +290,15 @@ scale_integer_to_float(uint32_t M, int N, int negative)
+ 
+ 	if (M == 0)
+ 		return negative ? -0.f : 0.f;
++	/* Fast path: M and 10^|N| are both exact floats here, so a single
++	 * multiplication or division gives the correctly rounded result. (For
++	 * every M and N in this range it is also what the code below returns.) */
++	if (M < (1u << 24) && N >= -10 && N <= 10)
++	{
++		static const float powers_of_ten[] = { 1e0f, 1e1f, 1e2f, 1e3f, 1e4f, 1e5f, 1e6f, 1e7f, 1e8f, 1e9f, 1e10f };
++		float f = N >= 0 ? (float)M * powers_of_ten[N] : (float)M / powers_of_ten[-N];
++		return negative ? -f : f;
++	}
+ 	if (N > 38)
+ 	{
+ 		/* Overflow.  */
