@@ -1,4 +1,5 @@
 #include <qfile.h>
+#include <vector>
 
 #include "checksum.h"
 
@@ -6,19 +7,22 @@ std::string compute_checksum(const QString& file_name, QCryptographicHash::Algor
 {
     QFile infile(file_name);
     qint64 file_size = infile.size();
-    const qint64 buffer_size = 10240;
+    // Large reads: with small ones, hashing a big document spends a lot of time in tens of thousands of
+    // read() system calls and context switches. (We don't mmap the file because it may be truncated
+    // while we read it, e.g. when LaTeX rewrites it, which would crash with SIGBUS.)
+    const qint64 buffer_size = 1 << 20;
 
-    if (infile.open(QIODevice::ReadOnly))
+    if (infile.open(QIODevice::ReadOnly | QIODevice::Unbuffered))
     {
-        char buffer[buffer_size];
-        int bytes_read;
-        int read_size = qMin(file_size, buffer_size);
+        std::vector<char> buffer(qMin(qMax(file_size, qint64(1)), buffer_size));
+        qint64 bytes_read;
+        qint64 read_size = qMin(file_size, buffer_size);
 
         QCryptographicHash hash(hash_algorithm);
-        while (read_size > 0 && (bytes_read = infile.read(buffer, read_size)) > 0)
+        while (read_size > 0 && (bytes_read = infile.read(buffer.data(), read_size)) > 0)
         {
             file_size -= bytes_read;
-            hash.addData(buffer, bytes_read);
+            hash.addData(buffer.data(), bytes_read);
             read_size = qMin(file_size, buffer_size);
         }
 
