@@ -654,22 +654,6 @@ void bench_db(int num_docs) {
 }
 
 
-// width in pixels of `page` rendered at `scale`, the same way render_request_pixmap computes it
-double doc_page_width_pixels(fz_context* ctx, const std::wstring& path, int page, float scale) {
-    static std::map<int, fz_rect> bounds;
-    static std::mutex bounds_mutex;
-    std::lock_guard<std::mutex> lock(bounds_mutex);
-    if (bounds.find(page) == bounds.end()) {
-        fz_document* d = open_document_with_file_name(ctx, path);
-        fz_page* p = fz_load_page(ctx, d, page);
-        bounds[page] = fz_bound_page(ctx, p);
-        fz_drop_page(ctx, p);
-        fz_drop_document(ctx, d);
-    }
-    fz_irect r = fz_round_rect(fz_transform_rect(bounds[page], fz_scale(scale, scale)));
-    return r.x1 - r.x0;
-}
-
 // Scrolls through the document with the real PdfRenderer (its worker threads, response cache and
 // garbage collection) and uploads textures like the main thread does, one page per step: pages
 // p and p+1 are visible and p+2 is prefetched. Measures how long each step waits for its pages and
@@ -742,6 +726,7 @@ void bench_session(fz_context* ctx, const std::wstring& path, int num_pages, con
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
     }
     glFinish();
+    double footprint_after_scroll = footprint_mb();
 
     // zoom in on the last pages: they have to be rendered again, which is where caching decoded
     // images and fonts in mupdf's store helps
@@ -753,23 +738,65 @@ void bench_session(fz_context* ctx, const std::wstring& path, int num_pages, con
             bool done = true;
             for (int page : { steps - 1, steps }) {
                 int w, h;
-                GLuint texture = renderer.find_rendered_page(path, page, true, -1, 1, 1, new_zoom, display_scale, &w, &h);
+                bool exact = false;
                 // a texture of the old zoom level is returned until the new one is ready
-                if (texture == 0 || w != (int)std::round(doc_page_width_pixels(ctx, path, page, new_zoom * display_scale))) done = false;
+                renderer.find_rendered_page(path, page, true, -1, 1, 1, new_zoom, display_scale, &w, &h, &exact);
+                if (!exact) done = false;
             }
             if (done) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         zoom_wait = ms_since(t_zoom);
     }
+
+    // What a user sees when zooming: sioyek draws every frame (~16 ms) with whatever texture is closest
+    // until the one for the current zoom level is rendered. Time from the last zoom change until both
+    // visible pages are sharp, for a single 2x step and for a pinch-like burst of zoom levels. (Whole
+    // pages: at zoom levels this high sioyek draws the visible part in tiles, which this doesn't do.)
+    auto frames_until_sharp = [&](float z) {
+        auto t0 = Clock::now();
+        while (true) {
+            bool done = true;
+            for (int page : { steps - 1, steps }) {
+                int w, h;
+                bool exact = false;
+                renderer.find_rendered_page(path, page, true, -1, 1, 1, z, display_scale, &w, &h, &exact);
+                if (!exact) done = false;
+            }
+            glFinish();
+            if (done) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+        return ms_since(t0);
+    };
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // workers are idle again
+    double zoom_step_wait = frames_until_sharp(zoom * 1.25f * 2.0f);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    double pinch_wait = 0;
+    {
+        float z = zoom * 2.5f;
+        for (int frame = 0; frame < 12; frame++) {
+            z *= 1.06f;
+            for (int page : { steps - 1, steps }) {
+                int w, h;
+                renderer.find_rendered_page(path, page, true, -1, 1, 1, z, display_scale, &w, &h);
+            }
+            glFinish();
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+        pinch_wait = frames_until_sharp(z);
+    }
+
     std::vector<double> sorted = waits;
     std::sort(sorted.begin(), sorted.end());
     report("session", "scroll " + std::to_string(steps) + " pages: total", total, "ms");
     report("session", "wait for visible pages: median", sorted[sorted.size() / 2], "ms");
     report("session", "wait for visible pages: p90", sorted[(sorted.size() * 9) / 10], "ms");
     report("session", "footprint growth during scroll (max)", max_scroll_footprint - before, "MB");
-    report("session", "footprint growth after scrolling stops", footprint_mb() - before, "MB");
+    report("session", "footprint growth after scrolling stops", footprint_after_scroll - before, "MB");
     report("session", "re-render 2 pages after zooming", zoom_wait, "ms");
+    report("session", "sharp after a 2x zoom step", zoom_step_wait, "ms");
+    report("session", "sharp after a pinch zoom burst", pinch_wait, "ms");
 
     if (getenv("BENCH_VMMAP")) {
         // memory regions by type, to see what the growth consists of

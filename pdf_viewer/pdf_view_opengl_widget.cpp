@@ -1003,6 +1003,136 @@ Document* PdfViewOpenGLWidget::doc(bool overview){
     return document_view->get_document();
 }
 
+// When zoomed in so far that a page is much bigger than the window, the page is drawn in tiles of
+// PAGE_TILE_SIZE pixels rendered at the current zoom level, over a texture of the whole page at a lower
+// resolution. Only the tiles in and near the view are rendered. Rendering and uploading whole pages at high
+// zoom levels takes long after every zoom change and needs a lot of memory (e.g. 440MB for a letter page at
+// 750% on a retina display), when only a small part of them is visible. Pages are tiled when they are
+// TILED_PAGE_AREA_IN_WINDOWS times as big as the window (a page fitted to the width of a landscape window is
+// about 2 windows), or at least MIN_TILED_PAGE_PIXELS.
+static const float TILED_PAGE_AREA_IN_WINDOWS = 2.5f;
+static const float MIN_TILED_PAGE_PIXELS = 4e6f;
+static const int PAGE_TILE_SIZE = 1024;
+
+bool PdfViewOpenGLWidget::should_tile_page(int page_number, float zoom_level, float* base_zoom_level) {
+    float display_scale = devicePixelRatioF();
+    float width = doc()->get_page_width(page_number);
+    float height = doc()->get_page_height(page_number);
+    float scale = zoom_level * display_scale;
+    float window_pixels = static_cast<float>(document_view->get_view_width()) * document_view->get_view_height() * display_scale * display_scale;
+    float page_pixels = width * scale * height * scale;
+    if ((width <= 0) || (height <= 0) || (page_pixels <= std::max(MIN_TILED_PAGE_PIXELS, TILED_PAGE_AREA_IN_WINDOWS * window_pixels))) {
+        return false;
+    }
+    // if the page has to be rendered for drawing under the tiles, it is rendered as big as the window
+    // (this doesn't depend on the zoom level, so it's rendered once for all zoom levels)
+    *base_zoom_level = std::sqrt(std::max(window_pixels, MIN_TILED_PAGE_PIXELS / TILED_PAGE_AREA_IN_WINDOWS) / (width * height)) / display_scale;
+    return true;
+}
+
+void PdfViewOpenGLWidget::render_page_tiles(int page_number, float zoom_level, float device_pixel_ratio, ColorPalette forced_color_palette) {
+    Document* document = doc();
+    float render_scale = zoom_level * devicePixelRatioF();
+    PagelessDocumentRect full_page_rect({ 0, 0, document->get_page_width(page_number), document->get_page_height(page_number) });
+    fz_irect page_pixels = fz_round_rect(fz_transform_rect(full_page_rect, fz_scale(render_scale, render_scale)));
+    int page_w = page_pixels.x1 - page_pixels.x0;
+    int page_h = page_pixels.y1 - page_pixels.y0;
+    if ((page_w <= 0) || (page_h <= 0)) return;
+
+    // the tiles are slices of the page, so this must divide the page like get_index_irect does
+    int nh = std::max(1, (page_w + PAGE_TILE_SIZE - 1) / PAGE_TILE_SIZE);
+    int nv = std::max(1, (page_h + PAGE_TILE_SIZE - 1) / PAGE_TILE_SIZE);
+    int tile_w = page_w / nh;
+    int tile_h = page_h / nv;
+
+    // where the page is drawn (in window pixels), the same as the whole page texture
+    WindowPos page_top_left = document_view->document_to_window_pos_in_pixels_uncentered(DocumentRect(full_page_rect, page_number).top_left());
+    float view_w = static_cast<float>(document_view->get_view_width());
+    float view_h = static_cast<float>(document_view->get_view_height());
+
+    // the tiles [first, last] that cover window pixels [from, to] in one direction, if any do
+    auto tile_range = [&](float from, float to, int origin, int page_size, int tile_size, int n, int* first, int* last) {
+        float pixel_from = (from - origin) * device_pixel_ratio;
+        float pixel_to = (to - origin) * device_pixel_ratio;
+        if ((pixel_to < 0) || (pixel_from >= page_size)) return false;
+        *first = std::clamp(static_cast<int>(std::floor(pixel_from / tile_size)), 0, n - 1);
+        *last = std::clamp(static_cast<int>(std::floor(pixel_to / tile_size)), 0, n - 1);
+        return true;
+    };
+
+    // visible tiles, and those next to them, which are rendered ahead of scrolling
+    int visible_h0, visible_h1, visible_v0, visible_v1, near_h0, near_h1, near_v0, near_v1;
+    bool any_visible = tile_range(0, view_w, page_top_left.x, page_w, tile_w, nh, &visible_h0, &visible_h1) &&
+        tile_range(0, view_h, page_top_left.y, page_h, tile_h, nv, &visible_v0, &visible_v1);
+    bool any_near = tile_range(-view_w / 4, view_w * 5 / 4, page_top_left.x, page_w, tile_w, nh, &near_h0, &near_h1) &&
+        tile_range(-view_h / 2, view_h * 3 / 2, page_top_left.y, page_h, tile_h, nv, &near_v0, &near_v1);
+    if (!any_near) return;
+
+    // Requests are rendered last in first out, so the tiles near the view are requested before the visible
+    // ones. Only the visible ones are drawn.
+    std::vector<std::pair<int, int>> tiles;
+    for (int v = near_v0; v <= near_v1; v++) {
+        for (int h = near_h0; h <= near_h1; h++) {
+            bool visible = any_visible && (v >= visible_v0) && (v <= visible_v1) && (h >= visible_h0) && (h <= visible_h1);
+            if (!visible) tiles.push_back({ h, v });
+        }
+    }
+    if (any_visible) {
+        for (int v = visible_v0; v <= visible_v1; v++) {
+            for (int h = visible_h0; h <= visible_h1; h++) {
+                tiles.push_back({ h, v });
+            }
+        }
+    }
+
+    bool program_bound = false;
+    for (auto [h, v] : tiles) {
+        int index = v * nh + h;
+        // this is either the tile of the current zoom level or while that is being rendered, the same tile
+        // of the closest zoom level (drawn stretched) if there is one
+        GLuint texture = pdf_renderer->find_rendered_page(document->get_path(),
+            page_number,
+            document->should_render_pdf_annotations(),
+            index,
+            nh,
+            nv,
+            zoom_level,
+            devicePixelRatioF(),
+            nullptr,
+            nullptr);
+
+        bool visible = any_visible && (v >= visible_v0) && (v <= visible_v1) && (h >= visible_h0) && (h <= visible_h1);
+        if ((texture == 0) || !visible) continue;
+
+        if (!program_bound) {
+            bind_program(forced_color_palette);
+            glEnableVertexAttribArray(0);
+            glEnableVertexAttribArray(1);
+            glBindBuffer(GL_ARRAY_BUFFER, shared_gl_objects.uv_buffer_object);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(g_quad_uvs), rotation_uvs[0], GL_DYNAMIC_DRAW);
+            program_bound = true;
+        }
+
+        int x0 = h * tile_w;
+        int x1 = (h == nh - 1) ? page_w : (h + 1) * tile_w;
+        int y0 = v * tile_h;
+        int y1 = (v == nv - 1) ? page_h : (v + 1) * tile_h;
+
+        fz_rect quad_rect;
+        quad_rect.x0 = 2 * (page_top_left.x + x0 / device_pixel_ratio - view_w / 2) / view_w;
+        quad_rect.x1 = 2 * (page_top_left.x + x1 / device_pixel_ratio - view_w / 2) / view_w;
+        quad_rect.y0 = -2 * (page_top_left.y + y0 / device_pixel_ratio - view_h / 2) / view_h;
+        quad_rect.y1 = -2 * (page_top_left.y + y1 / device_pixel_ratio - view_h / 2) / view_h;
+        float tile_vertices[8];
+        rect_to_quad(quad_rect, tile_vertices);
+
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glBindBuffer(GL_ARRAY_BUFFER, shared_gl_objects.vertex_buffer_object);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(tile_vertices), tile_vertices, GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+}
+
 void PdfViewOpenGLWidget::render_page(int page_number, bool in_overview, ColorPalette forced_color_palette, bool stencils_allowed) {
 
     if (!valid_document()) return;
@@ -1024,6 +1154,11 @@ void PdfViewOpenGLWidget::render_page(int page_number, bool in_overview, ColorPa
     }
 
     bool is_sliced = num_slices_for_page_rect(page_rect, &nh, &nv);
+
+    // at high zoom levels the page is drawn in tiles (see should_tile_page), under which the whole page is
+    // drawn from a texture rendered at base_zoom_level
+    float base_zoom_level = zoom_level;
+    bool use_tiles = !is_sliced && !in_overview && (rotation_index == 0) && should_tile_page(page_number, zoom_level, &base_zoom_level);
 
     for (int i = 0; i < nh * nv; i++) {
         int v_index = i / nh;
@@ -1064,16 +1199,33 @@ void PdfViewOpenGLWidget::render_page(int page_number, bool in_overview, ColorPa
             continue;
         }
 
-        GLuint texture = pdf_renderer->find_rendered_page(doc(in_overview)->get_path(),
-            page_number,
-            doc(in_overview)->should_render_pdf_annotations(),
-            index,
-            nh,
-            nv,
-            zoom_level,
-            devicePixelRatioF(),
-            &rendered_width,
-            &rendered_height);
+        GLuint texture = 0;
+        if (use_tiles) {
+            // Under the tiles, the page is drawn from whichever texture of the whole page there is (usually
+            // the one from before zooming in). Only if there is none, one is rendered.
+            texture = pdf_renderer->find_closest_rendered_page(doc(in_overview)->get_path(),
+                page_number, doc(in_overview)->should_render_pdf_annotations(), -1, 1, 1, zoom_level, devicePixelRatioF(), nullptr, nullptr);
+        }
+        if (texture == 0) {
+            texture = pdf_renderer->find_rendered_page(doc(in_overview)->get_path(),
+                page_number,
+                doc(in_overview)->should_render_pdf_annotations(),
+                index,
+                nh,
+                nv,
+                use_tiles ? base_zoom_level : zoom_level,
+                devicePixelRatioF(),
+                &rendered_width,
+                &rendered_height);
+        }
+
+        if (use_tiles) {
+            // the page is placed as if it was rendered at zoom_level, where the tiles are
+            float render_scale = zoom_level * devicePixelRatioF();
+            fz_irect page_pixels = fz_round_rect(fz_transform_rect(page_rect, fz_scale(render_scale, render_scale)));
+            rendered_width = page_pixels.x1 - page_pixels.x0;
+            rendered_height = page_pixels.y1 - page_pixels.y0;
+        }
 
         if (is_helper && !texture){
             is_helper_waiting_for_render = true;
@@ -1201,6 +1353,9 @@ void PdfViewOpenGLWidget::render_page(int page_number, bool in_overview, ColorPa
         }
         else {
             if (!SHOULD_DRAW_UNRENDERED_PAGES) {
+                if (use_tiles) {
+                    render_page_tiles(page_number, zoom_level, device_pixel_ratio, forced_color_palette);
+                }
                 continue;
             }
             float white[3] = {1, 1, 1};
@@ -1218,6 +1373,10 @@ void PdfViewOpenGLWidget::render_page(int page_number, bool in_overview, ColorPa
         glBindBuffer(GL_ARRAY_BUFFER, shared_gl_objects.vertex_buffer_object);
         glBufferData(GL_ARRAY_BUFFER, sizeof(page_vertices), page_vertices, GL_DYNAMIC_DRAW);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        if (use_tiles) {
+            render_page_tiles(page_number, zoom_level, device_pixel_ratio, forced_color_palette);
+        }
         
         if (document_view->is_two_page_mode() && (stencils_allowed)) {
             disable_stencil();
@@ -1469,31 +1628,46 @@ void PdfViewOpenGLWidget::my_render(QPainter* painter) {
                 //}
             }
         }
-        // prerender pages
+        // prerender the pages after the visible ones
         if (visible_pages.size() > 0) {
-            int num_pages = document_view->get_document()->num_pages();
+            Document* document = document_view->get_document();
+            int num_pages = document->num_pages();
             int max_page = visible_pages[visible_pages.size() - 1];
-            for (int i = 0; i < (PRERENDERED_PAGE_COUNT + 1); i++) {
-                if (max_page + i < num_pages) {
-                    float page_width = document_view->get_document()->get_page_width(max_page + i);
-                    float page_height = document_view->get_document()->get_page_height(max_page + i);
-                    PagelessDocumentRect page_rect({ 0, 0, page_width, page_height });
-                    int nh, nv;
-                    num_slices_for_page_rect(page_rect, &nh, &nv);
+            float zoom_level = document_view->get_zoom_level();
+            for (int i = 1; i <= PRERENDERED_PAGE_COUNT; i++) {
+                int page = max_page + i;
+                if (page >= num_pages) break;
 
-                    for (int k = 0; k < nh * nv; k++) {
-                        pdf_renderer->find_rendered_page(
-                            document_view->get_document()->get_path(),
-                            max_page + i,
-                            document_view->get_document()->should_render_pdf_annotations(),
-                            k,
-                            nh,
-                            nv,
-                            document_view->get_zoom_level(),
-                            devicePixelRatioF(),
-                            nullptr,
-                            nullptr);
+                float base_zoom_level;
+                if (should_tile_page(page, zoom_level, &base_zoom_level)) {
+                    // not the whole page at this zoom level, which is what tiles are for, but what is drawn
+                    // under the tiles until they are rendered
+                    if (!pdf_renderer->find_closest_rendered_page(document->get_path(), page, document->should_render_pdf_annotations(),
+                        -1, 1, 1, zoom_level, devicePixelRatioF(), nullptr, nullptr)) {
+                        pdf_renderer->find_rendered_page(document->get_path(), page, document->should_render_pdf_annotations(),
+                            -1, 1, 1, base_zoom_level, devicePixelRatioF(), nullptr, nullptr);
                     }
+                    continue;
+                }
+
+                PagelessDocumentRect page_rect({ 0, 0, document->get_page_width(page), document->get_page_height(page) });
+                int nh, nv;
+                bool is_sliced = num_slices_for_page_rect(page_rect, &nh, &nv);
+
+                for (int k = 0; k < nh * nv; k++) {
+                    // the same request as render_page makes (a page that isn't sliced is slice -1, requesting
+                    // slice 0 of 1 rendered the page a second time)
+                    pdf_renderer->find_rendered_page(
+                        document->get_path(),
+                        page,
+                        document->should_render_pdf_annotations(),
+                        is_sliced ? k : -1,
+                        nh,
+                        nv,
+                        zoom_level,
+                        devicePixelRatioF(),
+                        nullptr,
+                        nullptr);
                 }
             }
         }

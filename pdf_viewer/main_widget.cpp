@@ -289,6 +289,7 @@ const int MAX_SCROLLBAR = 10000;
 extern int RELOAD_INTERVAL_MILISECONDS;
 
 const unsigned int INTERVAL_TIME = 200;
+const int MENU_BAR_DELAY_MS = 300;
 
 #ifdef Q_OS_MACOS
 extern float MACOS_TITLEBAR_COLOR[3];
@@ -1031,8 +1032,9 @@ MainWidget::MainWidget(fz_context* mupdf_context,
         });
 
     // when pdf renderer's background threads finish rendering a page or find a new search result
-    // we need to update the ui
-    QObject::connect(pdf_renderer, &PdfRenderer::render_advance, this, &MainWidget::invalidate_render);
+    // we need to update the ui. A rendered page is shown right away: waiting for the validation timer
+    // delayed it by up to INTERVAL_TIME, e.g. after zooming or opening a document.
+    QObject::connect(pdf_renderer, &PdfRenderer::render_advance, this, &MainWidget::validate_render_soon);
     QObject::connect(pdf_renderer, &PdfRenderer::search_advance, this, &MainWidget::invalidate_ui);
 
     // we check periodically to see if the ui needs updating
@@ -1365,9 +1367,14 @@ MainWidget::MainWidget(fz_context* mupdf_context,
     if (MACOS_HIDE_TITLEBAR) {
         hideWindowTitleBar(winId());
     }
-    menu_bar = create_main_menu_bar();
-    setMenuBar(menu_bar);
-    menu_bar->stackUnder(text_command_line_edit_container);
+    // The menu bar is made once the window is up: making it first creates the native window, which
+    // then isn't created along with everything else when the window is shown, and delays the first
+    // page by ~50ms. (Only the native menu bar is affected, the key bindings don't depend on it.)
+    QTimer::singleShot(MENU_BAR_DELAY_MS, this, [this]() {
+        menu_bar = create_main_menu_bar();
+        setMenuBar(menu_bar);
+        menu_bar->stackUnder(text_command_line_edit_container);
+        });
 #endif
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
@@ -2044,6 +2051,20 @@ void MainWidget::invalidate_ui() {
     is_render_invalidated = true;
 }
 
+void MainWidget::validate_render_soon() {
+    invalidate_render();
+    // several pages finishing at about the same time are drawn in one frame
+    if (!is_render_validation_scheduled) {
+        is_render_validation_scheduled = true;
+        QTimer::singleShot(0, this, [this]() {
+            is_render_validation_scheduled = false;
+            if (is_render_invalidated) {
+                validate_render();
+            }
+            });
+    }
+}
+
 void MainWidget::open_document(const PortalViewState& lvs) {
     DocumentViewState dvs;
     auto path = checksummer->get_path(lvs.document_checksum);
@@ -2159,7 +2180,7 @@ void MainWidget::open_document(const std::wstring& path, std::optional<float> of
     }
 
     deselect_document_indices();
-    invalidate_render();
+    validate_render_soon();
 
 }
 
