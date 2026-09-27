@@ -3,6 +3,9 @@
 #include <string>
 #include <fstream>
 #include <mutex>
+#ifdef __APPLE__
+#include <os/lock.h>
+#endif
 #include <optional>
 #include <utility>
 #include <filesystem>
@@ -374,16 +377,53 @@ void verify_paths() {
 #undef CHECK_DIR_EXIST
 #undef CHECK_FILE_EXIST
 
-std::mutex mupdf_mutexes[FZ_LOCK_MAX];
+// MuPDF takes these locks very often and almost always uncontended (e.g. FZ_LOCK_ALLOC around every
+// font reference count change, which happens for every run of glyphs it interprets). On macOS a
+// pthread mutex costs several times more than os_unfair_lock in that case, which made locking ~15% of
+// the text extraction time. Each lock also gets its own cache line, so threads using different locks
+// (e.g. the render threads and the indexing thread) don't keep stealing the same line from each other.
+struct alignas(128) MupdfLock {
+#ifdef __APPLE__
+    os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+#else
+    std::mutex lock;
+#endif
+};
+
+MupdfLock mupdf_mutexes[FZ_LOCK_MAX];
 
 void lock_mutex(void* user, int lock) {
-    std::mutex* mut = (std::mutex*)user;
-    (mut + lock)->lock();
+    MupdfLock* locks = (MupdfLock*)user;
+#ifdef __APPLE__
+    os_unfair_lock_lock(&locks[lock].lock);
+#else
+    locks[lock].lock.lock();
+#endif
 }
 
 void unlock_mutex(void* user, int lock) {
-    std::mutex* mut = (std::mutex*)user;
-    (mut + lock)->unlock();
+    MupdfLock* locks = (MupdfLock*)user;
+#ifdef __APPLE__
+    os_unfair_lock_unlock(&locks[lock].lock);
+#else
+    locks[lock].lock.unlock();
+#endif
+}
+
+// Size limit of mupdf's resource cache (decoded images, fonts, ...). mupdf's default is 256MB. For
+// scanned documents it fills up with decoded images of pages that were scrolled past long ago (their
+// rendered textures are cached separately), 128MB halved the memory used after scrolling through a
+// scanned book without making scrolling or re-rendering after zooming any slower.
+size_t sioyek_mupdf_store_size() {
+    return 128 << 20;
+}
+
+fz_locks_context get_mupdf_locks() {
+    fz_locks_context locks;
+    locks.user = mupdf_mutexes;
+    locks.lock = lock_mutex;
+    locks.unlock = unlock_mutex;
+    return locks;
 }
 
 void add_paths_to_file_system_watcher(QFileSystemWatcher& watcher, const Path& default_path, const std::vector<Path>& user_paths) {
@@ -830,12 +870,9 @@ int main(int argc, char* args[]) {
     db_manager.ensure_schema_compatibility();
 
 
-    fz_locks_context locks;
-    locks.user = mupdf_mutexes;
-    locks.lock = lock_mutex;
-    locks.unlock = unlock_mutex;
+    fz_locks_context locks = get_mupdf_locks();
 
-    fz_context* mupdf_context = fz_new_context(nullptr, &locks, FZ_STORE_DEFAULT);
+    fz_context* mupdf_context = fz_new_context(nullptr, &locks, sioyek_mupdf_store_size());
 
     if (!VERBOSE) {
         fz_set_warning_callback(mupdf_context, nullptr, nullptr);
