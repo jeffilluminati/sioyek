@@ -3,6 +3,8 @@
 #include <qdatetime.h>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include <atomic>
 #include <thread>
 
@@ -347,8 +349,12 @@ void PdfRenderer::add_request(std::wstring document_path, int page, bool should_
 
         pending_requests_mutex.lock();
         // if the zoom level has changed, there is no point in previous requests with a different zoom level
+        // (a page drawn in tiles also needs the whole page at another zoom level, so requests for tiles
+        // only replace requests for tiles and requests for whole pages only those for whole pages)
         for (int i = pending_render_requests.size() - 1; i >= 0; i--) {
-            if (pending_render_requests[i].path == req.path && pending_render_requests[i].page == req.page && (pending_render_requests[i].zoom_level != zoom_level)) {
+            const RenderRequest& pending = pending_render_requests[i];
+            if (pending.path == req.path && pending.page == req.page && (pending.zoom_level != zoom_level) &&
+                ((pending.slice_index == -1) == (req.slice_index == -1))) {
                 pending_render_requests.erase(pending_render_requests.begin() + i);
             }
         }
@@ -365,6 +371,9 @@ void PdfRenderer::add_request(std::wstring document_path, int page, bool should_
             pending_render_requests.erase(pending_render_requests.begin());
         }
         pending_requests_mutex.unlock();
+        if (should_add) {
+            pending_requests_cv.notify_one();
+        }
     }
     else {
         std::wcout << "Error: could not find documnet" << std::endl;
@@ -397,6 +406,7 @@ void PdfRenderer::add_request(std::wstring document_path,
         search_request_mutex.lock();
         pending_search_request = req;
         search_request_mutex.unlock();
+        search_request_cv.notify_one();
     }
     else {
         std::wcout << "Error: could not find document" << std::endl;
@@ -405,7 +415,8 @@ void PdfRenderer::add_request(std::wstring document_path,
 
 //should only be called from the main thread
 
-GLuint PdfRenderer::find_rendered_page(std::wstring path, int page, bool should_render_annotations, int index, int num_h_slices, int num_v_slices, float zoom_level, float display_scale, int* page_width, int* page_height) {
+GLuint PdfRenderer::find_rendered_page(std::wstring path, int page, bool should_render_annotations, int index, int num_h_slices, int num_v_slices, float zoom_level, float display_scale, int* page_width, int* page_height, bool* exact) {
+    if (exact) *exact = false;
     //fz_document* doc = get_document_with_path(path);
     if (path.size() > 0) {
         RenderRequest req;
@@ -448,6 +459,7 @@ GLuint PdfRenderer::find_rendered_page(std::wstring path, int page, bool should_
             }
         }
         cached_response_mutex.unlock();
+        if (exact) *exact = result != 0;
         if (result == 0) {
             if (TOUCH_MODE) {
                 if (!no_rerender) {
@@ -475,6 +487,10 @@ GLuint PdfRenderer::find_rendered_page(std::wstring path, int page, bool should_
     return 0;
 }
 
+GLuint PdfRenderer::find_closest_rendered_page(std::wstring path, int page, bool should_render_annotations, int index, int num_h_slices, int num_v_slices, float zoom_level, float display_scale, int* page_width, int* page_height) {
+    return try_closest_rendered_page(path, page, should_render_annotations, index, num_h_slices, num_v_slices, zoom_level, display_scale, page_width, page_height);
+}
+
 GLuint PdfRenderer::try_closest_rendered_page(std::wstring doc_path, int page, bool should_render_annotations, int index, int num_h_slices, int num_v_slices, float zoom_level, float display_scale, int* page_width, int* page_height) {
     /*
     If the requested page is not available, we try to find the rendered page with the closest
@@ -482,7 +498,8 @@ GLuint PdfRenderer::try_closest_rendered_page(std::wstring doc_path, int page, b
     */
     cached_response_mutex.lock();
 
-    float min_diff = 10000.0f;
+    // the one whose zoom level is closest (by ratio: 1.0 is as far from 2.0 as 4.0 is)
+    float min_diff = std::numeric_limits<float>::infinity();
     GLuint best_texture = 0;
     RenderResponse* best_response = nullptr;
 
@@ -496,7 +513,7 @@ GLuint PdfRenderer::try_closest_rendered_page(std::wstring doc_path, int page, b
             (cached_resp.request.should_render_annotations == should_render_annotations) &&
             (cached_resp.request.page == page) &&
             (cached_resp.texture != 0)) {
-            float diff = cached_resp.request.zoom_level - zoom_level;
+            float diff = std::abs(std::log(cached_resp.request.zoom_level / zoom_level));
             if (diff <= min_diff) {
                 min_diff = diff;
                 best_texture = cached_resp.texture;
@@ -702,7 +719,10 @@ void PdfRenderer::run_search(int thread_index)
         }
         else {
             search_is_busy = false;
-            sleep_ms(100);
+            std::unique_lock<std::mutex> lock(search_request_mutex);
+            search_request_cv.wait_for(lock, std::chrono::milliseconds(100), [&]() {
+                return pending_search_request.has_value() || *should_quit_pointer;
+                });
         }
     }
 }
@@ -792,8 +812,16 @@ void PdfRenderer::run(int thread_index) {
             }
 
             thread_busy_status[thread_index] = false;
-            sleep_ms(100);
-            pending_requests_mutex.lock();
+            {
+                // Wait until add_request wakes us up (polling instead would delay every render that is
+                // requested while the workers are idle, e.g. after zooming, by up to the polling interval),
+                // looking at should_quit_pointer now and then.
+                std::unique_lock<std::mutex> lock(pending_requests_mutex);
+                pending_requests_cv.wait_for(lock, std::chrono::milliseconds(100), [&]() {
+                    return pending_render_requests.size() > 0 || *should_quit_pointer;
+                    });
+                lock.release(); // the loop goes on with pending_requests_mutex locked
+            }
         }
         if (quitting) break;
         if (*should_quit_pointer) {

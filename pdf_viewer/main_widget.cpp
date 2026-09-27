@@ -1031,8 +1031,9 @@ MainWidget::MainWidget(fz_context* mupdf_context,
         });
 
     // when pdf renderer's background threads finish rendering a page or find a new search result
-    // we need to update the ui
-    QObject::connect(pdf_renderer, &PdfRenderer::render_advance, this, &MainWidget::invalidate_render);
+    // we need to update the ui. A rendered page is shown right away: waiting for the validation timer
+    // delayed it by up to INTERVAL_TIME, e.g. after zooming or opening a document.
+    QObject::connect(pdf_renderer, &PdfRenderer::render_advance, this, &MainWidget::validate_render_soon);
     QObject::connect(pdf_renderer, &PdfRenderer::search_advance, this, &MainWidget::invalidate_ui);
 
     // we check periodically to see if the ui needs updating
@@ -2044,6 +2045,20 @@ void MainWidget::invalidate_ui() {
     is_render_invalidated = true;
 }
 
+void MainWidget::validate_render_soon() {
+    invalidate_render();
+    // several pages finishing at about the same time are drawn in one frame
+    if (!is_render_validation_scheduled) {
+        is_render_validation_scheduled = true;
+        QTimer::singleShot(0, this, [this]() {
+            is_render_validation_scheduled = false;
+            if (is_render_invalidated) {
+                validate_render();
+            }
+            });
+    }
+}
+
 void MainWidget::open_document(const PortalViewState& lvs) {
     DocumentViewState dvs;
     auto path = checksummer->get_path(lvs.document_checksum);
@@ -2159,7 +2174,7 @@ void MainWidget::open_document(const std::wstring& path, std::optional<float> of
     }
 
     deselect_document_indices();
-    invalidate_render();
+    validate_render_soon();
 
 }
 

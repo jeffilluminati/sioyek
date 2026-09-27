@@ -372,6 +372,7 @@ public:
     // being invalid could be a latex document that is changed since being loaded). This just means that
     // the current drawing of MainWidget is not correct (for example due to moving vertically)
     bool is_render_invalidated = false;
+    bool is_render_validation_scheduled = false;
 
     // determines if the UI is invalid and needs to be updated
     // this can be the case for example when updating the search progress
@@ -548,6 +549,9 @@ public:
 
     void invalidate_render();
     void invalidate_ui();
+    // invalidates the render and validates it as soon as the event loop gets to it, rather than at
+    // the next tick of validation_interval_timer
+    void validate_render_soon();
     void open_document(const Path& path, std::optional<float> offset_x = {}, std::optional<float> offset_y = {}, std::optional<float> zoom_level = {});
     void open_document(const std::wstring& path, std::optional<float> offset_x = {}, std::optional<float> offset_y = {}, std::optional<float> zoom_level = {});
     void open_document_with_hash(const std::string& hash, std::optional<float> offset_x = {}, std::optional<float> offset_y = {}, std::optional<float> zoom_level = {});

@@ -4,6 +4,7 @@
 #include <string>
 #include <mupdf/fitz.h>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <variant>
 #include <unordered_map>
@@ -90,6 +91,9 @@ class PdfRenderer : public QObject {
     std::mutex opened_documents_mutex;
     std::mutex pending_requests_mutex;
     std::mutex search_request_mutex;
+    // idle worker threads wait on these for requests
+    std::condition_variable pending_requests_cv;
+    std::condition_variable search_request_cv;
     std::mutex cached_response_mutex;
     std::vector<std::mutex> pixmap_drop_mutex;
     std::vector<fz_context*> thread_contexts;
@@ -154,7 +158,12 @@ public:
         std::optional<std::pair<int,
         int>> range = {});
 
-    GLuint find_rendered_page(std::wstring path, int page, bool should_render_annotations, int index, int num_h_slices, int num_v_slices, float zoom_level, float display_scale, int* page_width, int* page_height);
+    // Returns the texture of the page at the given zoom level, or while that is being rendered, the one
+    // closest to it (*exact, if given, tells which).
+    GLuint find_rendered_page(std::wstring path, int page, bool should_render_annotations, int index, int num_h_slices, int num_v_slices, float zoom_level, float display_scale, int* page_width, int* page_height, bool* exact = nullptr);
+    // The rendered page (or slice) with the zoom level closest to the given one, without requesting
+    // anything to be rendered. 0 if there is none.
+    GLuint find_closest_rendered_page(std::wstring path, int page, bool should_render_annotations, int index, int num_h_slices, int num_v_slices, float zoom_level, float display_scale, int* page_width, int* page_height);
     void delete_old_pages(bool force_all = false, bool invalidate_all = false);
     void add_password(std::wstring path, std::string password);
     void debug();
