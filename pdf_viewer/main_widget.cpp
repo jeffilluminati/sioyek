@@ -2459,7 +2459,10 @@ void MainWidget::handle_right_click(WindowPos click_pos, bool down, bool is_shif
         return;
     }
     if (RIGHT_CLICK_COMMAND.size() > 0) {
-        execute_macro_if_enabled(RIGHT_CLICK_COMMAND);
+        // handle_right_click is called on both press and release, only run the command once
+        if (!down) {
+            execute_macro_if_enabled(RIGHT_CLICK_COMMAND);
+        }
         return;
     }
 
