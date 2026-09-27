@@ -212,6 +212,11 @@ unix:!mac:!android {
 mac {
     QMAKE_CXXFLAGS += -std=c++20
     LIBS += -ldl -L$$PWD/mupdf/build/release -lmupdf -lmupdf-third -lmupdf-threads -lz
+    # build_mac.sh builds mupdf with libjpeg-turbo (static) when it is installed with Homebrew
+    for(jpeg_turbo_prefix, $$list(/opt/homebrew/opt/jpeg-turbo /usr/local/opt/jpeg-turbo)) {
+        isEmpty(JPEG_TURBO_LIB):exists($$jpeg_turbo_prefix/lib/libjpeg.a): JPEG_TURBO_LIB = $$jpeg_turbo_prefix/lib/libjpeg.a
+    }
+    !isEmpty(JPEG_TURBO_LIB): LIBS += $$JPEG_TURBO_LIB
     CONFIG+=sdk_no_version_check
     QMAKE_MACOSX_DEPLOYMENT_TARGET = 15
     ICON = pdf_viewer\icon2.ico
