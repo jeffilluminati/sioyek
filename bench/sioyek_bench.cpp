@@ -26,11 +26,13 @@
 // environment: BENCH_STD_MUTEX=1        use plain std::mutex MuPDF locks (sioyek's previous implementation)
 //              BENCH_UPLOAD_VARIANTS=1  also time RGBA and BGRA texture uploads of the same pages
 //              BENCH_PIXMAP_HASHES=1    print a hash of every rendered page and of the text index, to
-//                                       check that two builds produce the same output
+//                                       check that two builds produce the same output (see
+//                                       bench/compare_output.sh)
 //              BENCH_VMMAP=1            print `vmmap --summary` after the session phase
 //              BENCH_DUMP_DIR=dir       write the raw samples of every page rendered by the render phase
 //
-// build with bench/build_bench.sh, create test documents with bench/gen_corpus.py, profile with
+// build with bench/build_bench.sh, create test documents with bench/gen_corpus.py (and, to check that
+// rendering changes leave the output identical, bench/gen_render_tests.py), profile with
 // `xcrun xctrace record --template 'Time Profiler' --launch -- bench/sioyek_bench ...` and summarize
 // the trace with bench/xctrace_summary.py.
 
