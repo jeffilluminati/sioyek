@@ -28,6 +28,7 @@
 //              BENCH_PIXMAP_HASHES=1    print a hash of every rendered page and of the text index, to
 //                                       check that two builds produce the same output
 //              BENCH_VMMAP=1            print `vmmap --summary` after the session phase
+//              BENCH_DUMP_DIR=dir       write the raw samples of every page rendered by the render phase
 //
 // build with bench/build_bench.sh, create test documents with bench/gen_corpus.py, profile with
 // `xcrun xctrace record --template 'Time Profiler' --launch -- bench/sioyek_bench ...` and summarize
@@ -194,6 +195,15 @@ void bench_render(fz_context* ctx, const std::wstring& path, const std::vector<i
                     req.should_render_annotations = true;
                     fz_pixmap* pixmap = render_request_pixmap(c, docs[t], req);
                     total_pixels += (long long)pixmap->w * pixmap->h;
+                    if (const char* dump_dir = getenv("BENCH_DUMP_DIR")) {
+                        // raw samples, to compare the output of different builds pixel by pixel
+                        std::string name = std::string(dump_dir) + "/page" + std::to_string(pages[i]) + "_" +
+                            std::to_string(pixmap->w) + "x" + std::to_string(pixmap->h) + "x" + std::to_string(pixmap->n) + ".raw";
+                        if (FILE* f = fopen(name.c_str(), "wb")) {
+                            for (int row = 0; row < pixmap->h; row++) fwrite(pixmap->samples + (size_t)row * pixmap->stride, 1, (size_t)pixmap->w * pixmap->n, f);
+                            fclose(f);
+                        }
+                    }
                     if (getenv("BENCH_PIXMAP_HASHES")) {
                         // FNV-1a of the rendered samples, to compare the output of different builds
                         uint64_t hash = 1469598103934665603ull;

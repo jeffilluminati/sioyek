@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
+./mupdf-patches/apply.sh
+
 # Compile mupdf
 cd mupdf
 make USE_SYSTEM_HARFBUZZ=yes -j$(nproc)

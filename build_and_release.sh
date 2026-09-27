@@ -10,6 +10,7 @@ if [[ ! -f linuxdeployqt-continuous-x86_64.AppImage ]]; then
 	chmod +x linuxdeployqt-continuous-x86_64.AppImage
 fi
 
+./mupdf-patches/apply.sh
 cd mupdf
 make USE_SYSTEM_HARFBUZZ=yes -j$MAKE_PARALLEL
 cd ..

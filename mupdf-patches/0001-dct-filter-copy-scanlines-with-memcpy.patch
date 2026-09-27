@@ -1,0 +1,58 @@
+Faster JPEG decoding: the DCT filter handed out decoded data through a 4KB buffer, so
+scanlines of large images never fit and every byte was copied one at a time. Use a 64KB
+buffer and memcpy. The decoded data is unchanged.
+
+diff --git a/source/fitz/filter-dct.c b/source/fitz/filter-dct.c
+index c6f039c02..bd009e94c 100644
+--- a/source/fitz/filter-dct.c
++++ b/source/fitz/filter-dct.c
+@@ -23,6 +23,7 @@
+ #include "mupdf/fitz.h"
+ 
+ #include <stdio.h>
++#include <string.h>
+ #include <jpeglib.h>
+ 
+ #ifndef SHARE_JPEG
+@@ -49,7 +50,8 @@ typedef struct
+ 	jmp_buf jb;
+ 	char msg[JMSG_LENGTH_MAX];
+ 
+-	unsigned char buffer[4096];
++	/* Large enough for whole scanlines of big images, so they are decoded straight into it. */
++	unsigned char buffer[65536];
+ } fz_dctd;
+ 
+ #ifdef SHARE_JPEG
+@@ -272,8 +274,13 @@ next_dctd(fz_context *ctx, fz_stream *stm, size_t max)
+ 			state->wp = state->scanline;
+ 		}
+ 
+-		while (state->rp < state->wp && p < ep)
+-			*p++ = *state->rp++;
++		if (state->rp < state->wp && p < ep)
++		{
++			size_t n = fz_mini(state->wp - state->rp, ep - p);
++			memcpy(p, state->rp, n);
++			p += n;
++			state->rp += n;
++		}
+ 
+ 		while (p < ep)
+ 		{
+@@ -296,8 +303,13 @@ next_dctd(fz_context *ctx, fz_stream *stm, size_t max)
+ 				state->wp = state->scanline + state->stride;
+ 			}
+ 
+-			while (state->rp < state->wp && p < ep)
+-				*p++ = *state->rp++;
++			if (state->rp < state->wp && p < ep)
++			{
++				size_t n = fz_mini(state->wp - state->rp, ep - p);
++				memcpy(p, state->rp, n);
++				p += n;
++				state->rp += n;
++			}
+ 		}
+ 		stm->rp = state->buffer;
+ 		stm->wp = p;

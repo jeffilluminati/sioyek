@@ -10,6 +10,7 @@ set -e
 if [ -z ${MAKE_PARALLEL+x} ]; then export MAKE_PARALLEL=1; else echo "MAKE_PARALLEL defined"; fi
 echo "MAKE_PARALLEL set to $MAKE_PARALLEL"
 
+./mupdf-patches/apply.sh
 cd mupdf
 #make USE_SYSTEM_HARFBUZZ=yes USE_SYSTEM_GLUT=yes SYS_GLUT_CFLAGS="${sys_glut_clfags}" SYS_GLUT_LIBS="${sys_glut_libs}" SYS_HARFBUZZ_CFLAGS="${sys_harfbuzz_clfags}" SYS_HARFBUZZ_LIBS="${sys_harfbuzz_libs}" -j 4
 # mupdf is built with -O3 and as LTO bitcode, so it's optimized together with sioyek at link time.

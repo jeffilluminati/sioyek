@@ -1,3 +1,7 @@
+rem apply sioyek's patches to mupdf (skipping the ones that are already applied)
+for %%p in (mupdf-patches\*.patch) do (
+    git -C mupdf apply --reverse --check ..\%%p 2>nul || git -C mupdf apply ..\%%p || exit /b 1
+)
 cd mupdf\platform\win32\
 msbuild -maxcpucount mupdf.sln /m /property:Configuration=Debug /property:MultiProcessorCompilation=true
 msbuild -maxcpucount mupdf.sln /m /property:Configuration=Release /property:MultiProcessorCompilation=true

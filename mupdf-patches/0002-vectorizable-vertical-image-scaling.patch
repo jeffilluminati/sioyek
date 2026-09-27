@@ -1,0 +1,46 @@
+Faster vertical image scaling on platforms without the ARM assembly (e.g. arm64, x86):
+accumulate whole source rows at a time so the loops are contiguous and get vectorized.
+The additions happen in the same order, so the scaled image is unchanged.
+
+diff --git a/source/fitz/draw-scale-simple.c b/source/fitz/draw-scale-simple.c
+index 84942cd21..67fd922af 100644
+--- a/source/fitz/draw-scale-simple.c
++++ b/source/fitz/draw-scale-simple.c
+@@ -1261,20 +1261,27 @@ scale_row_from_temp(unsigned char * FZ_RESTRICT dst, const unsigned char * FZ_RE
+ 
+ 	contrib++; /* Skip min */
+ 	len = *contrib++;
+-	for (x=width; x > 0; x--)
++
++	/* Every pixel of the row uses the same weights, so accumulate whole source rows at a
++	 * time (adding them in the same order as one pixel at a time does, so the result is
++	 * the same). The inner loops are then contiguous and the compiler vectorizes them. */
++	for (x = 0; x < width; x += 256)
+ 	{
+-		const unsigned char *min = src;
+-		int val = 128;
+-		int len2 = len;
+-		const int *contrib2 = contrib;
++		int acc[256];
++		int chunk = width - x < 256 ? width - x : 256;
++		int j, k;
+ 
+-		while (len2-- > 0)
++		for (k = 0; k < chunk; k++)
++			acc[k] = 128;
++		for (j = 0; j < len; j++)
+ 		{
+-			val += *min * *contrib2++;
+-			min += width;
++			const unsigned char *s = src + x + (size_t)j * width;
++			int weight = contrib[j];
++			for (k = 0; k < chunk; k++)
++				acc[k] += s[k] * weight;
+ 		}
+-		*dst++ = (unsigned char)(val>>8);
+-		src++;
++		for (k = 0; k < chunk; k++)
++			dst[x + k] = (unsigned char)(acc[k] >> 8);
+ 	}
+ }
+ 
