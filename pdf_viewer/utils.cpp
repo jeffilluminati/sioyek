@@ -52,6 +52,7 @@
 #include <qjsonarray.h>
 #include <quuid.h>
 #include <qjsondocument.h>
+#include <qregularexpression.h>
 #include "path.h"
 
 #ifdef SIOYEK_ANDROID
@@ -4310,6 +4311,100 @@ std::vector<SearchResult> search_text_with_index(const std::wstring& super_fast_
 }
 
 
+namespace {
+
+// A UTF-16 copy of part of a wide string, for QRegularExpression, which can map positions in the copy back
+// to positions in the wide string. The two only differ where wchar_t is 32 bits wide and the text has
+// characters outside the BMP, which take two UTF-16 code units. Code points that aren't valid Unicode (lone
+// surrogates, which bad PDFs can produce) become U+FFFD, since PCRE2 rejects text with invalid UTF-16.
+class Utf16Copy {
+public:
+    Utf16Copy(const std::wstring& source, int begin, int end) : begin(begin) {
+        const wchar_t* src = source.data() + begin;
+        int n = end - begin;
+        if constexpr (sizeof(wchar_t) == 4) {
+            int num_pairs = 0;
+            for (int i = 0; i < n; i++) {
+                num_pairs += (uint32_t)src[i] - 0x10000u <= 0xfffffu;
+            }
+            text = QString(n + num_pairs, Qt::Uninitialized);
+            char16_t* out = reinterpret_cast<char16_t*>(text.data());
+            int j = 0;
+            for (int i = 0; i < n; i++) {
+                uint32_t c = (uint32_t)src[i];
+                if (c < 0xd800 || (c >= 0xe000 && c < 0x10000)) {
+                    out[j++] = (char16_t)c;
+                }
+                else if (c - 0x10000u <= 0xfffffu) {
+                    pair_positions.push_back(j);
+                    c -= 0x10000;
+                    out[j++] = (char16_t)(0xd800 + (c >> 10));
+                    out[j++] = (char16_t)(0xdc00 + (c & 0x3ff));
+                }
+                else {
+                    out[j++] = 0xfffd;
+                }
+            }
+        }
+        else {
+            text = QString(n, Qt::Uninitialized);
+            char16_t* out = reinterpret_cast<char16_t*>(text.data());
+            for (int i = 0; i < n; i++) {
+                char16_t c = (char16_t)src[i];
+                bool high = (c & 0xfc00) == 0xd800;
+                bool low = (c & 0xfc00) == 0xdc00;
+                if (high && i + 1 < n && ((char16_t)src[i + 1] & 0xfc00) == 0xdc00) {
+                    out[i] = c;
+                    out[i + 1] = (char16_t)src[i + 1];
+                    i++;
+                }
+                else {
+                    out[i] = (high || low) ? 0xfffd : c;
+                }
+            }
+        }
+    }
+
+    // position in the source string of a position in the copy (which must not be inside a surrogate pair)
+    int source_index(qsizetype pos) const {
+        auto pairs_before = std::lower_bound(pair_positions.begin(), pair_positions.end(), pos) - pair_positions.begin();
+        return begin + (int)(pos - pairs_before);
+    }
+
+    QString text;
+
+private:
+    int begin;
+    std::vector<qsizetype> pair_positions;
+};
+
+// Compiling a regular expression is not free, and while the document isn't indexed yet the search thread
+// searches every page separately with the same expression.
+const QRegularExpression& get_search_regex(const std::wstring& query, SearchCaseSensitivity case_sensitive) {
+    thread_local std::wstring last_query;
+    thread_local SearchCaseSensitivity last_case_sensitive;
+    thread_local QRegularExpression regex;
+    thread_local bool compiled = false;
+
+    if (!compiled || query != last_query || case_sensitive != last_case_sensitive) {
+        QRegularExpression::PatternOptions options = QRegularExpression::UseUnicodePropertiesOption;
+        if (case_sensitive != SearchCaseSensitivity::CaseSensitive) {
+            options |= QRegularExpression::CaseInsensitiveOption;
+        }
+        regex = QRegularExpression(QString::fromStdWString(query), options);
+        regex.optimize();
+        last_query = query;
+        last_case_sensitive = case_sensitive;
+        compiled = true;
+    }
+    return regex;
+}
+
+}
+
+// Uses QRegularExpression (PCRE2, JIT compiled where available) rather than std::wregex, which is
+// very slow: tens of times slower on a large document. The pattern syntax is the same for everything but
+// rarely used corner cases (PCRE2 is Perl compatible, std::regex uses ECMAScript's Perl-like grammar).
 std::vector<SearchResult> search_regex_with_index(const std::wstring& super_fast_search_index,
     const std::vector<int>& page_begin_indices,
     std::wstring query,
@@ -4321,81 +4416,59 @@ std::vector<SearchResult> search_regex_with_index(const std::wstring& super_fast
 
     std::vector<SearchResult> output;
 
-    std::wregex regex;
     if (min_page < 0) min_page = 0;
-    if (max_page > page_begin_indices.size() - 1) max_page = page_begin_indices.size() - 1;
-
-    try {
-        if (case_sensitive != SearchCaseSensitivity::CaseSensitive) {
-            regex = std::wregex(query, std::regex_constants::icase);
-        }
-        else {
-            regex = std::wregex(query);
-        }
-    }
-    catch (const std::regex_error&) {
+    if (max_page > (int)page_begin_indices.size() - 1) max_page = page_begin_indices.size() - 1;
+    if (min_page > max_page) {
         return output;
     }
 
+    const QRegularExpression& regex = get_search_regex(query, case_sensitive);
+    if (!regex.isValid()) {
+        return output;
+    }
 
     std::vector<SearchResult> before_results;
     bool is_before = true;
 
-    int offset = page_begin_indices[min_page];
-
-    std::wstring::const_iterator search_start(super_fast_search_index.begin() + offset);
-
-    std::wsmatch match;
-    int empty_tolerance = 1000;
-
+    // matches may start on max_page and end after it
+    Utf16Copy subject(super_fast_search_index, page_begin_indices[min_page], super_fast_search_index.size());
 
     int match_page = min_page;
 
-    while (std::regex_search(search_start, super_fast_search_index.cend(), match, regex)) {
-        std::deque<fz_rect> match_rects;
-        std::vector<fz_rect> compressed_match_rects;
+    QRegularExpressionMatchIterator matches = regex.globalMatch(subject.text);
+    while (matches.hasNext()) {
+        QRegularExpressionMatch match = matches.next();
+        int start_index = subject.source_index(match.capturedStart());
+        int end_index = subject.source_index(match.capturedEnd());
 
-        //int match_page = super_fast_search_index_pages[offset + match.position()];
+        // empty matches (of expressions like "a*") aren't results
+        if (start_index == end_index) {
+            continue;
+        }
 
-        if (match_page >= begin_page) {
-            is_before = false;
+        while ((match_page < (int)page_begin_indices.size() - 1) && page_begin_indices[match_page + 1] <= start_index) {
+            match_page++;
         }
 
         if (match_page > max_page) {
             break;
         }
 
-        int start_index = offset + match.position();
-        int end_index = offset + match.position() + match.length();
-
-        while ((match_page < page_begin_indices.size() - 1) && page_begin_indices[match_page + 1] < start_index) {
-            match_page++;
+        if (match_page >= begin_page) {
+            is_before = false;
         }
 
-        if (start_index < end_index) {
-            SearchResult res;
-            res.page = match_page;
-            res.begin_index_in_page = start_index - page_begin_indices[match_page];
-            res.end_index_in_page = end_index - page_begin_indices[match_page];
+        SearchResult res;
+        res.page = match_page;
+        res.begin_index_in_page = start_index - page_begin_indices[match_page];
+        res.end_index_in_page = end_index - page_begin_indices[match_page];
 
-            if (!((match_page < min_page) || (match_page > max_page))) {
-                if (is_before) {
-                    before_results.push_back(res);
-                }
-                else {
-                    output.push_back(res);
-                }
-            }
+        if (is_before) {
+            before_results.push_back(res);
         }
         else {
-            empty_tolerance--;
-            if (empty_tolerance == 0) {
-                break;
-            }
+            output.push_back(res);
         }
-
-        offset = end_index;
-        search_start = match.suffix().first;
     }
     output.insert(output.end(), before_results.begin(), before_results.end());
     return output;

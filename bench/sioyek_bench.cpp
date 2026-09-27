@@ -418,6 +418,8 @@ void bench_search(Document* doc) {
         { L"zqxjv", SearchCaseSensitivity::CaseSensitive, false, "absent, case sensitive" },
         { L"zqxjv", SearchCaseSensitivity::CaseInsensitive, false, "absent, case insensitive" },
         { L"[0-9]+\\.[0-9]+", SearchCaseSensitivity::CaseSensitive, true, "regex numbers" },
+        { L"(convex|linear) (optimal|space)", SearchCaseSensitivity::CaseInsensitive, true, "regex alternation, case insensitive" },
+        { L"\\b[A-Z][a-z]+ing\\b", SearchCaseSensitivity::CaseSensitive, true, "regex word pattern" },
     };
     int n = doc->num_pages();
     for (const auto& q : queries) {

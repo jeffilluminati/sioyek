@@ -309,6 +309,45 @@ std::vector<SearchResult> search_text_with_index(const std::wstring& super_fast_
 
 }
 
+// The matches found by the previous std::wregex based search_regex_with_index: its search loop, as
+// (start, end) positions in the index. (Its page attribution had off-by-one bugs that the new version
+// doesn't reproduce, so only the matches themselves are compared.)
+std::vector<std::pair<int, int>> regex_matches(const std::wstring& index, const std::wstring& query, SearchCaseSensitivity case_sensitive) {
+    std::vector<std::pair<int, int>> output;
+    std::wregex regex;
+    try {
+        if (case_sensitive != SearchCaseSensitivity::CaseSensitive) {
+            regex = std::wregex(query, std::regex_constants::icase);
+        }
+        else {
+            regex = std::wregex(query);
+        }
+    }
+    catch (const std::regex_error&) {
+        return output;
+    }
+    int offset = 0;
+    std::wstring::const_iterator search_start(index.begin());
+    std::wsmatch match;
+    int empty_tolerance = 1000;
+    while (std::regex_search(search_start, index.cend(), match, regex)) {
+        int start_index = offset + match.position();
+        int end_index = offset + match.position() + match.length();
+        if (start_index < end_index) {
+            output.push_back({ start_index, end_index });
+        }
+        else {
+            empty_tolerance--;
+            if (empty_tolerance == 0) {
+                break;
+            }
+        }
+        offset = end_index;
+        search_start = match.suffix().first;
+    }
+    return output;
+}
+
 std::string compute_checksum(const QString& file_name, QCryptographicHash::Algorithm hash_algorithm)
 {
     QFile infile(file_name);
@@ -445,6 +484,56 @@ void compare_search(const std::wstring& index, const std::vector<int>& page_begi
                   " ref=" + std::to_string(a.size()) + " new=" + std::to_string(b.size()));
 }
 
+// Compares the matches of the QRegularExpression based search_regex_with_index with those of std::wregex.
+// Returns whether they are the same. Expressions that can match the empty string are skipped: the old
+// search stopped at the first empty match, the new one steps over them.
+bool compare_regex_search(const std::wstring& index, const std::vector<int>& page_begin_indices, const std::wstring& query,
+                          SearchCaseSensitivity cs, const std::string& where, bool expect_same = true) {
+    auto a = reference::regex_matches(index, query, cs);
+    int n = page_begin_indices.size();
+    auto results = search_regex_with_index(index, page_begin_indices, query, cs, 0, 0, n - 1);
+    std::vector<std::pair<int, int>> b;
+    for (const auto& r : results) {
+        b.push_back({ page_begin_indices[r.page] + r.begin_index_in_page, page_begin_indices[r.page] + r.end_index_in_page });
+    }
+    // page attribution: a match belongs to the last page that begins at or before it
+    bool pages_ok = true;
+    for (const auto& r : results) {
+        int start = page_begin_indices[r.page] + r.begin_index_in_page;
+        pages_ok &= page_begin_indices[r.page] <= start && (r.page + 1 >= n || page_begin_indices[r.page + 1] > start);
+    }
+    check(pages_ok, "search_regex_with_index page attribution '" + narrow(query) + "' " + where);
+    bool ok = a == b;
+    if (expect_same) {
+        size_t first_diff = 0;
+        while (first_diff < a.size() && first_diff < b.size() && a[first_diff] == b[first_diff]) first_diff++;
+        check(ok, "search_regex_with_index '" + narrow(query) + "' cs=" + std::to_string((int)cs) + " " + where +
+                      " ref=" + std::to_string(a.size()) + " new=" + std::to_string(b.size()) + " first difference at #" + std::to_string(first_diff));
+    }
+    return ok;
+}
+
+void regex_search_tests(const std::wstring& index, const std::vector<int>& page_begin_indices, const std::string& where) {
+    if (index.empty() || page_begin_indices.empty()) return;
+    const std::vector<std::wstring> patterns = {
+        L"optimal", L"Section [0-9]+", L"[0-9]+\\.[0-9]+", L"\\b[A-Z][a-z]+\\b", L"(convex|linear) (optimal|space)",
+        L"[a-z]+ing\\b", L"\\d{4}", L"\\(\\d+(\\.\\d+)*\\)", L"e[a-z]{2,3}s", L"a[^ ]*z", L"(the )+", L"th?e[ a-z]",
+        L"[[:alpha:]]+[[:digit:]]", L"(\\w+) \\1", L"[A-Z]{2,}", L"\\s{2,}", L"[aeiou]{3}", L"(?:ab|cd|ef)", L"x.y",
+        L"f\\(x\\)", L"[.,;]", L"\\bwe\\b", L"proof.{0,40}lemma", L"(a|b)*c", L"[^a-z ]+", L"Lemma|Theorem|Corollary",
+        L"\\w+@\\w+", L"[0-9]{1,2}\\.[0-9]", L"q[^u]", L"\\W+", L"ing|ed|s\\b",
+    };
+    for (const auto& pattern : patterns) {
+        for (auto cs : { SearchCaseSensitivity::CaseSensitive, SearchCaseSensitivity::CaseInsensitive }) {
+            compare_regex_search(index, page_begin_indices, pattern, cs, where);
+        }
+    }
+    // invalid expressions find nothing
+    for (std::wstring bad : { L"(", L"[a-", L"*a", L"a{2,1}" }) {
+        check(search_regex_with_index(index, page_begin_indices, bad, SearchCaseSensitivity::CaseSensitive, 0, 0, page_begin_indices.size() - 1).empty(),
+              "invalid regex '" + narrow(bad) + "' " + where);
+    }
+}
+
 std::wstring random_case(std::wstring s, std::mt19937& rng) {
     for (auto& c : s) {
         if (rng() % 2) c = std::towupper(c);
@@ -530,6 +619,47 @@ void fuzz_unicode_search(std::mt19937& rng) {
     }
 }
 
+// Regex search over text with non ASCII and non BMP characters (whose UTF-16 positions differ from their
+// positions in the index) and invalid code points. ASCII only expressions must find the same matches;
+// for \\w, \\b and case insensitive matching of non ASCII letters the engines are allowed to differ
+// (PCRE2 uses Unicode properties), so those are only reported.
+void unicode_regex_tests(std::mt19937& rng) {
+    std::wstring alphabet = L"aAbBkK iIeE01.\x00E9\x00C9\x03B1\x0391\x0436\x4E2D";
+    if (sizeof(wchar_t) == 4) {
+        alphabet.push_back((wchar_t)0x1D400); // mathematical bold A
+        alphabet.push_back((wchar_t)0x1F600);
+        alphabet.push_back((wchar_t)0x20000);
+        alphabet.push_back((wchar_t)0xD800);  // lone surrogate code point
+    }
+    for (int round = 0; round < 30; round++) {
+        std::wstring index;
+        std::vector<int> page_begin_indices;
+        int pages = 1 + rng() % 30;
+        for (int p = 0; p < pages; p++) {
+            page_begin_indices.push_back(index.size());
+            int n = rng() % 300;
+            for (int i = 0; i < n; i++) index.push_back(alphabet[rng() % alphabet.size()]);
+        }
+        std::string where = "unicode round " + std::to_string(round);
+        for (std::wstring pattern : { L"ab", L"a[bk]+", L"[0-9]+\\.[0-9]", L"b.i", L"a.{2}e", L"[^ ]{3}", L"k[^a-z]k", L"e+", L"\x00E9\x03B1", L"\x4E2D." }) {
+            compare_regex_search(index, page_begin_indices, pattern, SearchCaseSensitivity::CaseSensitive, where);
+            compare_regex_search(index, page_begin_indices, pattern, SearchCaseSensitivity::CaseInsensitive, where, false);
+        }
+        if (sizeof(wchar_t) == 4) {
+            std::wstring astral;
+            astral.push_back((wchar_t)0x1D400);
+            compare_regex_search(index, page_begin_indices, astral, SearchCaseSensitivity::CaseSensitive, where);
+            compare_regex_search(index, page_begin_indices, astral + L"[a-z]", SearchCaseSensitivity::CaseSensitive, where);
+        }
+        for (std::wstring pattern : { L"\\w+", L"\\b\\w", L"\x00C9" }) {
+            if (!compare_regex_search(index, page_begin_indices, pattern, SearchCaseSensitivity::CaseInsensitive, where, false)) {
+                static int reported = 0;
+                if (reported++ < 3) printf("  note: '%s' case insensitive differs on non ASCII text (Unicode aware in PCRE2)\n", narrow(pattern).c_str());
+            }
+        }
+    }
+}
+
 void checksum_tests(const std::vector<QString>& files) {
     QTemporaryDir dir;
     std::vector<QString> all = files;
@@ -593,6 +723,7 @@ extern "C" int test_main(int argc, char** argv) {
             fz_drop_stext_page(ctx, stext_page);
         }
         search_tests(index, page_begin_indices, rng, 400, "file");
+        regex_search_tests(index, page_begin_indices, "file");
         fz_drop_document(ctx, doc);
     }
 
@@ -600,6 +731,8 @@ extern "C" int test_main(int argc, char** argv) {
     fuzz_text_processing(rng);
     printf("fuzzing unicode search\n");
     fuzz_unicode_search(rng);
+    printf("regex search on unicode and non BMP text\n");
+    unicode_regex_tests(rng);
     printf("checksums\n");
     checksum_tests(files);
 
