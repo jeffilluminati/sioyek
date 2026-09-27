@@ -1,6 +1,7 @@
 #include "document.h"
 #include <algorithm>
 #include <thread>
+#include <atomic>
 #include <cmath>
 #include "coordinates.h"
 #include "utf8.h"
@@ -1377,8 +1378,107 @@ int Document::get_offset_page_number(float y_offset) {
     return (it - accum_page_heights.begin());
 }
 
+static std::vector<std::pair<std::wstring, float>> get_page_toc_candidates(fz_stext_page* stext_page);
+
+namespace {
+
+// What indexing finds on one page, see Document::index_document.
+struct PageIndex {
+    std::wstring text;
+    std::map<std::wstring, IndexedData> references;
+    std::map<std::wstring, std::vector<IndexedData>> equations;
+    std::vector<IndexedData> generic;
+    std::vector<std::pair<std::wstring, float>> toc_candidates;
+    bool done = false;
+    bool failed = false;
+};
+
+void index_page(fz_context* ctx, fz_document* doc, int page_number, bool collect_toc_candidates, PageIndex& result) {
+    fz_stext_page* stext_page = nullptr;
+    fz_var(stext_page);
+    fz_try(ctx) {
+        // we don't use get_stext_with_page_number here on purpose because it would lead to many unnecessary allocations
+        stext_page = fz_new_stext_page_from_page_number(ctx, doc, page_number, nullptr);
+
+        std::vector<fz_stext_char*> flat_chars;
+        get_flat_chars_from_stext_page(stext_page, flat_chars);
+
+        if (SUPER_FAST_SEARCH) {
+            std::vector<int> page_begin_indices;
+            flat_char_prism2(flat_chars, page_number, result.text, page_begin_indices);
+        }
+
+        index_references(stext_page, page_number, result.references);
+        index_equations(flat_chars, page_number, result.equations);
+        index_generic(flat_chars, page_number, result.generic);
+
+        if (collect_toc_candidates) {
+            result.toc_candidates = get_page_toc_candidates(stext_page);
+        }
+    }
+    fz_always(ctx) {
+        fz_drop_stext_page(ctx, stext_page);
+    }
+    fz_catch(ctx) {
+        result.failed = true;
+    }
+}
+
+}
+
+// Settings of the main mupdf context that affect how documents are read, so that contexts
+// created for other threads read them the same way.
+struct MupdfContextSettings {
+    fz_warning_cb* warning_callback = nullptr;
+    void* warning_user = nullptr;
+    fz_error_cb* error_callback = nullptr;
+    void* error_user = nullptr;
+    std::optional<std::string> user_css;
+    int use_document_css = 1;
+
+    explicit MupdfContextSettings(fz_context* ctx) {
+        warning_callback = fz_warning_callback(ctx, &warning_user);
+        error_callback = fz_error_callback(ctx, &error_user);
+        if (const char* css = fz_user_css(ctx)) {
+            user_css = css;
+        }
+        use_document_css = fz_use_document_css(ctx);
+    }
+};
+
+// A context of its own for an indexing thread. Clones of the main context share its locks, and
+// mupdf takes the allocation lock for every run of glyphs it interprets, so threads extracting
+// text with clones spent most of their time waiting for each other. A context that is only used
+// by one thread needs no locks at all. (Nothing mupdf creates with it is shared with other threads.)
+static fz_context* new_single_thread_context(const MupdfContextSettings& settings) {
+    // text extraction only caches fonts and small resources
+    fz_context* ctx = fz_new_context(nullptr, nullptr, 32 << 20);
+    if (!ctx) {
+        return nullptr;
+    }
+    fz_set_warning_callback(ctx, settings.warning_callback, settings.warning_user);
+    fz_set_error_callback(ctx, settings.error_callback, settings.error_user);
+    bool failed = false;
+    fz_try(ctx) {
+        if (settings.user_css) {
+            fz_set_user_css(ctx, settings.user_css->c_str());
+        }
+        fz_set_use_document_css(ctx, settings.use_document_css);
+        fz_register_document_handlers(ctx);
+    }
+    fz_catch(ctx) {
+        failed = true;
+    }
+    if (failed) {
+        fz_drop_context(ctx);
+        return nullptr;
+    }
+    return ctx;
+}
+
 void Document::index_document(bool* invalid_flag) {
     int n = num_pages();
+    MupdfContextSettings context_settings(context);
 
     if (this->document_indexing_thread.has_value()) {
         // if we are already indexing figures, we should wait for the previous thread to finish
@@ -1388,7 +1488,7 @@ void Document::index_document(bool* invalid_flag) {
     is_document_indexing_required = true;
     is_indexing = true;
 
-    this->document_indexing_thread = std::thread([this, n, invalid_flag]() {
+    this->document_indexing_thread = std::thread([this, n, invalid_flag, context_settings]() {
         std::vector<IndexedData> local_generic_data;
         std::map<std::wstring, IndexedData> local_reference_data;
         std::map<std::wstring, std::vector<IndexedData>> local_equation_data;
@@ -1400,53 +1500,112 @@ void Document::index_document(bool* invalid_flag) {
         std::vector<TocNode*> top_level_nodes;
         int num_added_toc_entries = 0;
 
-        fz_context* context_ = fz_clone_context(context);
-        fz_try(context_) {
+        // Extracting the text of the pages (mostly mupdf's work) is what takes the time, so pages are
+        // indexed by several threads, each with its own mupdf context and document. Each page's
+        // results are merged into the document's as soon as all the pages before it are done, in page
+        // order, which gives exactly the same results as indexing the pages one after another.
+        std::vector<PageIndex> pages(std::max(n, 0));
+        std::mutex merge_mutex;
+        int num_merged = 0;
+        std::atomic<int> next_page{ 0 };
+        std::atomic<bool> stopped{ false };
+        std::atomic<bool> toc_full{ false };
+        bool collect_toc_candidates = CREATE_TABLE_OF_CONTENTS_IF_NOT_EXISTS && (top_level_toc_nodes.size() == 0);
 
-            //			fz_document* doc_ = fz_open_document(context_, utf8_encode(file_name).c_str());
-            fz_document* doc_ = open_document_with_file_name(context_, file_name);
-
-            if (document_needs_password) {
-                fz_authenticate_password(context_, doc_, correct_password.c_str());
-            }
-            for (int i = 0; i < n; i++) {
-                // when we close a document before its indexing is finished, we should stop indexing as soon as posible
-                if (!is_document_indexing_required) {
-                    break;
+        // requires merge_mutex
+        auto merge_finished_pages = [&]() {
+            while (num_merged < n && pages[num_merged].done) {
+                PageIndex& page = pages[num_merged];
+                if (page.failed) {
+                    // like when pages were indexed one by one, stop at the first page that can't be read
+                    stopped = true;
+                    return;
                 }
-
-                // we don't use get_stext_with_page_number here on purpose because it would lead to many unnecessary allocations
-                fz_stext_page* stext_page = fz_new_stext_page_from_page_number(context_, doc_, i, nullptr);
-
-                std::vector<fz_stext_char*> flat_chars;
-                get_flat_chars_from_stext_page(stext_page, flat_chars);
 
                 if (SUPER_FAST_SEARCH) {
-                    flat_char_prism2(flat_chars, i, local_super_fast_search_index, local_page_begin_indices);
+                    local_page_begin_indices.push_back(local_super_fast_search_index.size());
+                    local_super_fast_search_index += page.text;
                 }
-
-                index_references(stext_page, i, local_reference_data);
-                index_equations(flat_chars, i, local_equation_data);
-                index_generic(flat_chars, i, local_generic_data);
+                // a reference found on a later page replaces an earlier one
+                for (auto& [text, data] : page.references) {
+                    local_reference_data[text] = std::move(data);
+                }
+                for (auto& [text, equations] : page.equations) {
+                    std::vector<IndexedData>& all = local_equation_data[text];
+                    all.insert(all.end(), equations.begin(), equations.end());
+                }
+                local_generic_data.insert(local_generic_data.end(), page.generic.begin(), page.generic.end());
 
                 // if the document doesn't have table of contents, try to create one
                 if (CREATE_TABLE_OF_CONTENTS_IF_NOT_EXISTS && (top_level_toc_nodes.size() == 0)) {
                     if (num_added_toc_entries < MAX_CREATED_TABLE_OF_CONTENTS_SIZE) {
-                        num_added_toc_entries += add_stext_page_to_created_toc(stext_page, i, toc_stack, top_level_nodes);
+                        num_added_toc_entries += add_toc_candidates_to_created_toc(page.toc_candidates, num_merged, toc_stack, top_level_nodes);
+                    }
+                    else {
+                        toc_full = true;
                     }
                 }
 
-                fz_drop_stext_page(context_, stext_page);
+                page = PageIndex(); // release its memory
+                num_merged++;
+            }
+        };
+
+        auto index_pages = [&]() {
+            fz_context* context_ = new_single_thread_context(context_settings);
+            if (!context_) {
+                context_ = fz_clone_context(context);
+            }
+            fz_document* doc_ = nullptr;
+            bool can_read = true;
+            fz_var(doc_);
+            fz_try(context_) {
+                doc_ = open_document_with_file_name(context_, file_name);
+                if (document_needs_password) {
+                    fz_authenticate_password(context_, doc_, correct_password.c_str());
+                }
+            }
+            fz_catch(context_) {
+                can_read = false;
             }
 
+            // when we close a document before its indexing is finished, we should stop indexing as soon as posible
+            while (!stopped && is_document_indexing_required) {
+                int i = next_page++;
+                if (i >= n) {
+                    break;
+                }
+                PageIndex result;
+                if (can_read) {
+                    index_page(context_, doc_, i, collect_toc_candidates && !toc_full, result);
+                }
+                else {
+                    result.failed = true;
+                }
+
+                std::lock_guard<std::mutex> lock(merge_mutex);
+                pages[i] = std::move(result);
+                pages[i].done = true;
+                merge_finished_pages();
+            }
 
             fz_drop_document(context_, doc_);
+            fz_drop_context(context_);
+        };
+
+        // leave a core for the user interface and rendering
+        int num_threads = std::max(1, std::min(get_num_performance_cores() - 1, n));
+        std::vector<std::thread> helpers;
+        for (int i = 1; i < num_threads; i++) {
+            helpers.emplace_back(index_pages);
         }
-        fz_catch(context_) {
+        index_pages();
+        for (auto& helper : helpers) {
+            helper.join();
+        }
+        if (stopped) {
             std::wcout << L"There was an error in indexing thread.\n";
         }
-
-        fz_drop_context(context_);
 
         document_indexing_mutex.lock();
 
@@ -2921,7 +3080,25 @@ std::optional<PdfLink> Document::get_link_in_pos(int page, float doc_x, float do
     return {};
 }
 
-int Document::add_stext_page_to_created_toc(fz_stext_page* stext_page,
+// Titles on a page that could be table of contents entries (their text and y), in order.
+static std::vector<std::pair<std::wstring, float>> get_page_toc_candidates(fz_stext_page* stext_page) {
+    std::vector<std::pair<std::wstring, float>> candidates;
+    LL_ITER(block, stext_page->first_block) {
+        std::vector<fz_stext_char*> chars;
+        get_flat_chars_from_block(block, chars);
+        if (chars.size() > 0) {
+            std::wstring block_string;
+            std::vector<int> indices;
+            get_text_from_flat_chars(chars, block_string, indices);
+            if (is_string_titlish(block_string)) {
+                candidates.push_back(std::make_pair(block_string, block->bbox.y0));
+            }
+        }
+    }
+    return candidates;
+}
+
+int Document::add_toc_candidates_to_created_toc(const std::vector<std::pair<std::wstring, float>>& candidates,
     int page_number,
     std::vector<TocNode*>& toc_node_stack,
     std::vector<TocNode*>& top_level_nodes) {
@@ -2941,7 +3118,10 @@ int Document::add_stext_page_to_created_toc(fz_stext_page* stext_page,
                 toc_node_stack.pop_back();
             }
 
-            if (are_same) return;
+            if (are_same) {
+                delete node;
+                return;
+            }
             num_new_entries += 1;
 
             if (toc_node_stack.size() > 0) {
@@ -2954,24 +3134,22 @@ int Document::add_stext_page_to_created_toc(fz_stext_page* stext_page,
         }
     };
 
-    LL_ITER(block, stext_page->first_block) {
-        std::vector<fz_stext_char*> chars;
-        get_flat_chars_from_block(block, chars);
-        if (chars.size() > 0) {
-            std::wstring block_string;
-            std::vector<int> indices;
-            get_text_from_flat_chars(chars, block_string, indices);
-            if (is_string_titlish(block_string)) {
-                TocNode* new_node = new TocNode;
-                new_node->page = page_number;
-                new_node->title = block_string;
-                new_node->x = 0;
-                new_node->y = block->bbox.y0;
-                add_toc_node(new_node);
-            }
-        }
+    for (const auto& [title, y] : candidates) {
+        TocNode* new_node = new TocNode;
+        new_node->page = page_number;
+        new_node->title = title;
+        new_node->x = 0;
+        new_node->y = y;
+        add_toc_node(new_node);
     }
     return num_new_entries;
+}
+
+int Document::add_stext_page_to_created_toc(fz_stext_page* stext_page,
+    int page_number,
+    std::vector<TocNode*>& toc_node_stack,
+    std::vector<TocNode*>& top_level_nodes) {
+    return add_toc_candidates_to_created_toc(get_page_toc_candidates(stext_page), page_number, toc_node_stack, top_level_nodes);
 }
 
 float Document::document_to_absolute_y(int page, float doc_y) {

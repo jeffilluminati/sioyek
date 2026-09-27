@@ -376,6 +376,10 @@ public:
     std::string get_bookmark_index_uuid(int index);
 
     //void create_table_of_contents(std::vector<TocNode*>& top_nodes);
+    int add_toc_candidates_to_created_toc(const std::vector<std::pair<std::wstring, float>>& candidates,
+        int page_number,
+        std::vector<TocNode*>& toc_node_stack,
+        std::vector<TocNode*>& top_level_nodes);
     int add_stext_page_to_created_toc(fz_stext_page* stext_page,
         int page_number,
         std::vector<TocNode*>& toc_node_stack,

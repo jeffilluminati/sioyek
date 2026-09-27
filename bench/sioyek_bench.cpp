@@ -6,6 +6,7 @@
 //   checksum    CachedChecksummer::get_checksum (MD5 of the whole file)
 //   open        Document::open with synchronous page dimension loading
 //   index       the background indexing thread started by Document::open
+//   firstpages  rendering the first pages while the document is being indexed (not in "all")
 //   breakdown   the per-page steps of the indexing thread, timed individually
 //   search      Document::search_text / search_regex over the super fast index
 //   fullsearch  PdfRenderer's search thread (used when super_fast_search is off)
@@ -62,9 +63,32 @@
 
 #include <mupdf/fitz.h>
 
+// The index fingerprint (BENCH_PIXMAP_HASHES) reads Document's private index data. document.h's
+// own includes come first so that only Document itself is affected. (Test harness only: clang
+// doesn't change the layout of a class because of access specifiers.)
+#include <vector>
+#include <string>
+#include <optional>
+#include <thread>
+#include <mutex>
+#include <map>
+#include <unordered_map>
+#include <deque>
+#include <regex>
+#include <qstandarditemmodel.h>
+#include <qdatetime.h>
+#include <qobject.h>
+#include <qnetworkreply.h>
+#include <qjsondocument.h>
+#include <qurlquery.h>
+#include "book.h"
+#include "coordinates.h"
+#define private public
+#include "document.h"
+#undef private
+
 #include "checksum.h"
 #include "database.h"
-#include "document.h"
 #include "pdf_renderer.h"
 #include "utils.h"
 #include "sqlite3.h"
@@ -842,6 +866,42 @@ void bench_banded(fz_context* ctx, const std::wstring& path, const std::vector<i
     fz_drop_context(c);
 }
 
+
+// Hashes of everything the indexing thread produces, to check that two builds index identically.
+struct Fnv {
+    uint64_t h = 1469598103934665603ull;
+    void byte(uint8_t b) { h = (h ^ b) * 1099511628211ull; }
+    void u32(uint32_t v) { for (int i = 0; i < 4; i++) byte((v >> (8 * i)) & 0xFF); }
+    void f(float v) { uint32_t u; memcpy(&u, &v, 4); u32(u); }
+    void str(const std::wstring& s) { u32(s.size()); for (wchar_t c : s) u32((uint32_t)c); }
+    void data(const IndexedData& d) { u32(d.page); f(d.y_offset); str(d.text); }
+};
+
+void hash_toc(Fnv& fnv, const std::vector<TocNode*>& nodes) {
+    fnv.u32(nodes.size());
+    for (const TocNode* node : nodes) {
+        fnv.str(node->title);
+        fnv.u32(node->page);
+        fnv.f(node->x);
+        fnv.f(node->y);
+        hash_toc(fnv, node->children);
+    }
+}
+
+void print_index_fingerprint(Document* doc) {
+    Fnv text, pages, refs, eqs, generic, toc;
+    for (wchar_t c : doc->super_fast_search_index) text.u32((uint32_t)c);
+    for (int b : doc->super_fast_page_begin_indices) pages.u32(b);
+    for (const auto& [key, d] : doc->reference_indices) { refs.str(key); refs.data(d); }
+    for (const auto& [key, list] : doc->equation_indices) { eqs.str(key); for (const auto& d : list) eqs.data(d); }
+    for (const auto& d : doc->generic_indices) generic.data(d);
+    hash_toc(toc, doc->created_top_level_toc_nodes);
+    printf("index text %016llx pages %016llx (%zu) refs %016llx (%zu) eqs %016llx (%zu) generic %016llx (%zu) toc %016llx (%zu)\n",
+           (unsigned long long)text.h, (unsigned long long)pages.h, doc->super_fast_page_begin_indices.size(),
+           (unsigned long long)refs.h, doc->reference_indices.size(), (unsigned long long)eqs.h, doc->equation_indices.size(),
+           (unsigned long long)generic.h, doc->generic_indices.size(), (unsigned long long)toc.h, doc->created_top_level_toc_nodes.size());
+}
+
 void run(const Options& opt) {
     current_file = QString::fromStdWString(opt.file).toStdString();
     printf("\n== %s [%s]\n", current_file.c_str(), opt.label.c_str());
@@ -882,6 +942,29 @@ void run(const Options& opt) {
     double open_ms = ms_since(t0);
     auto index_start = Clock::now();
     int n = doc->num_pages();
+
+    if (opt.phases.count("firstpages")) {
+        // what the user waits for right after opening: the first pages, rendered while the
+        // document is being indexed in the background
+        fz_context* c = fz_clone_context(ctx);
+        fz_document* d = open_document_with_file_name(c, opt.file);
+        for (int page = 0; page < std::min(n, 3); page++) {
+            RenderRequest req;
+            req.path = opt.file;
+            req.page = page;
+            req.zoom_level = opt.scale;
+            req.display_scale = 1.0f;
+            req.slice_index = -1;
+            req.should_render_annotations = true;
+            auto t = Clock::now();
+            fz_pixmap* p = render_request_pixmap(c, d, req);
+            report("firstpages", "render page " + std::to_string(page) + " while indexing", ms_since(t), "ms");
+            fz_drop_pixmap(c, p);
+        }
+        report("firstpages", "indexing still running", doc->get_is_indexing() ? 1 : 0, "");
+        fz_drop_document(c, d);
+        fz_drop_context(c);
+    }
     if (has("open")) {
         report("open", "open + page dimensions (" + std::to_string(n) + " pages)", open_ms, "ms");
         report("memory", "footprint after open", footprint_mb(), "MB");
@@ -894,9 +977,7 @@ void run(const Options& opt) {
         report("index", "background indexing thread", ms_since(index_start), "ms");
         report("index", "super fast index chars", (double)doc->get_super_fast_search_index().size(), "chars");
         if (getenv("BENCH_PIXMAP_HASHES")) {
-            uint64_t hash = 1469598103934665603ull;
-            for (wchar_t c : doc->get_super_fast_search_index()) hash = (hash ^ (uint32_t)c) * 1099511628211ull;
-            printf("index hash %016llx\n", (unsigned long long)hash);
+            print_index_fingerprint(doc);
         }
         report("memory", "footprint after index", footprint_mb(), "MB");
     }

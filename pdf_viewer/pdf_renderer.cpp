@@ -5,9 +5,6 @@
 #include <chrono>
 #include <atomic>
 #include <thread>
-#ifdef __APPLE__
-#include <sys/sysctl.h>
-#endif
 
 extern bool LINEAR_TEXTURE_FILTERING;
 extern int NUM_V_SLICES;
@@ -283,17 +280,6 @@ GLuint create_texture_from_pixmap(fz_pixmap* pixmap) {
     return result;
 }
 
-static int num_performance_cores() {
-#ifdef __APPLE__
-    int count = 0;
-    size_t size = sizeof(count);
-    if (sysctlbyname("hw.perflevel0.physicalcpu", &count, &size, nullptr, 0) == 0 && count > 0) {
-        return count;
-    }
-#endif
-    return std::max(1u, std::thread::hardware_concurrency());
-}
-
 PdfRenderer::PdfRenderer(int num_threads, bool* should_quit_pointer, fz_context* context_to_clone) : context_to_clone(context_to_clone),
 pixmaps_to_drop(num_threads),
 pixmap_drop_mutex(num_threads),
@@ -314,7 +300,7 @@ num_threads(num_threads)
     // Cores that aren't busy rendering can help rendering heavy pages (see render_request_pixmap).
     // One is left for the main thread. Only performance cores count: a page rendered in bands is only
     // done when its slowest band is, so a band on an efficiency core would delay the whole page.
-    band_cores = std::max(0, num_performance_cores() - 1);
+    band_cores = std::max(0, get_num_performance_cores() - 1);
     QObject::connect(&garbage_collect_timer, &QTimer::timeout, [&]() {
         delete_old_pages();
         });

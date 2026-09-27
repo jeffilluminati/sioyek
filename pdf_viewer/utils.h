@@ -355,6 +355,9 @@ std::vector<SearchResult> search_text_with_index(const std::wstring& super_fast_
 bool pred_case_sensitive(const wchar_t& c1, const wchar_t& c2);
 bool pred_case_insensitive(const wchar_t& c1, const wchar_t& c2);
 
+// number of cores that are worth giving CPU heavy work to
+int get_num_performance_cores();
+
 
 std::vector<SearchResult> search_regex_with_index(const std::wstring& super_fast_search_index,
     const std::vector<int>& page_begin_indcies,

@@ -22,6 +22,10 @@
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
+#include <thread>
 
 #include <optional>
 #include <functional>
@@ -4819,4 +4823,16 @@ bool stext_page_has_lines(fz_stext_page* page) {
         }
     }
     return false;
+}
+
+int get_num_performance_cores() {
+#ifdef __APPLE__
+    // on Apple silicon, only the performance cores (hardware_concurrency includes the efficiency ones)
+    int count = 0;
+    size_t size = sizeof(count);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &count, &size, nullptr, 0) == 0 && count > 0) {
+        return count;
+    }
+#endif
+    return std::max(1u, std::thread::hardware_concurrency());
 }
