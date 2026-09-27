@@ -21,6 +21,9 @@ extern float CUSTOM_BACKGROUND_COLOR[3];
 extern float CUSTOM_TEXT_COLOR[3];
 extern float CUSTOM_COLOR_CONTRAST;
 extern int MAX_PENDING_REQUESTS;
+
+// what every OpenGL implementation sioyek runs on supports, until the actual limit is known
+std::atomic<int> max_texture_size{ 16384 };
 extern unsigned int CACHE_INVALID_MILIES;
 
 // Rendered pages are only ever uploaded to OpenGL textures. On desktop OpenGL we render straight into
@@ -116,7 +119,7 @@ static void draw_display_list_band(fz_context* ctx, fz_display_list* list, fz_ma
     }
 }
 
-fz_pixmap* render_request_pixmap(fz_context* mupdf_context, fz_document* doc, const RenderRequest& req, int helper_threads, int* bands_used) {
+fz_pixmap* render_request_pixmap(fz_context* mupdf_context, fz_document* doc, const RenderRequest& req, int helper_threads, int* bands_used, fz_display_list* page_list) {
     fz_matrix transform_matrix = fz_pre_scale(fz_identity, req.zoom_level * req.display_scale, req.zoom_level * req.display_scale);
 
 #ifdef SIOYEK_BGRA_TEXTURES
@@ -149,12 +152,19 @@ fz_pixmap* render_request_pixmap(fz_context* mupdf_context, fz_document* doc, co
             bbox = get_index_irect(rect, req.slice_index, transform_matrix, req.num_h_slices, req.num_v_slices);
         }
 
+        if ((bbox.x1 - bbox.x0 > max_texture_size) || (bbox.y1 - bbox.y0 > max_texture_size)) {
+            fz_throw(mupdf_context, FZ_ERROR_LIMIT, "page is too big for a texture");
+        }
+
         rendered_pixmap = fz_new_pixmap_with_bbox(mupdf_context, colorspace, bbox, nullptr, alpha);
         // opaque white background (this also sets the alpha channel to 255)
         fz_clear_pixmap_with_value(mupdf_context, rendered_pixmap, 0xFF);
 
         int num_bands = std::max(1, std::min(helper_threads + 1, rendered_pixmap->h / 64));
-        if (num_bands == 1) {
+        if ((num_bands == 1) && page_list) {
+            draw_display_list_band(mupdf_context, page_list, transform_matrix, rendered_pixmap, rendered_pixmap->y, rendered_pixmap->y + rendered_pixmap->h);
+        }
+        else if (num_bands == 1) {
             draw_device = fz_new_draw_device(mupdf_context, transform_matrix, rendered_pixmap);
 
             if (req.should_render_annotations) {
@@ -169,7 +179,10 @@ fz_pixmap* render_request_pixmap(fz_context* mupdf_context, fz_document* doc, co
             // Heavy page: interpret it once into a display list and rasterize horizontal bands of
             // it in parallel. Rasterizing (filling paths, decoding and scaling images) is where the
             // time goes on such pages, so this divides most of the render time by the number of bands.
-            if (req.should_render_annotations) {
+            if (page_list) {
+                list = fz_keep_display_list(mupdf_context, page_list);
+            }
+            else if (req.should_render_annotations) {
                 list = fz_new_display_list_from_page(mupdf_context, page);
             }
             else {
@@ -431,7 +444,7 @@ GLuint PdfRenderer::find_rendered_page(std::wstring path, int page, bool should_
         cached_response_mutex.lock();
         GLuint result = 0;
         for (auto& cached_resp : cached_responses) {
-            if (cached_resp.pending) continue;
+            if (cached_resp.pending || cached_resp.failed) continue;
 
             if ((cached_resp.request == req) && (cached_resp.invalid == false)) {
                 cached_resp.last_access_time = QDateTime::currentMSecsSinceEpoch();
@@ -445,8 +458,14 @@ GLuint PdfRenderer::find_rendered_page(std::wstring path, int page, bool should_
                 if (cached_resp.texture != 0) {
                     result = cached_resp.texture;
                 }
+                else if ((frame_upload_budget_ms > 0) && (frame_upload_ms >= frame_upload_budget_ms)) {
+                    // this frame has spent its time on uploads, it's uploaded in a later one
+                    uploads_deferred = true;
+                }
                 else {
+                    auto upload_begin = std::chrono::steady_clock::now();
                     result = create_texture_from_pixmap(cached_resp.pixmap);
+                    frame_upload_ms += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - upload_begin).count();
 
                     // don't need the pixmap anymore
                     pixmap_drop_mutex[cached_resp.thread].lock();
@@ -485,6 +504,113 @@ GLuint PdfRenderer::find_rendered_page(std::wstring path, int page, bool should_
         return result;
     }
     return 0;
+}
+
+void PdfRenderer::begin_frame(float upload_budget_ms) {
+    frame_upload_budget_ms = upload_budget_ms;
+    frame_upload_ms = 0;
+    uploads_deferred = false;
+}
+
+bool PdfRenderer::were_uploads_deferred() {
+    return uploads_deferred;
+}
+
+// Returns (a reference to) the display list of the page of `req`, from the cache if it's there. If it
+// isn't, it is made and cached if make_if_missing (otherwise, or if it can't be made, nullptr is returned). Several threads
+// rendering tiles of a page at the same time wait for the one that makes it. The lists are made with
+// the thread's own document, but only hold references to fonts and images, so any worker can draw them.
+fz_display_list* PdfRenderer::get_page_display_list(fz_context* ctx, fz_document* doc, const RenderRequest& req, bool make_if_missing) {
+    const int max_cached_lists = 4;
+
+    std::unique_lock<std::mutex> lock(display_lists_mutex);
+    while (true) {
+        auto it = std::find_if(display_lists.begin(), display_lists.end(), [&](const CachedDisplayList& cached) {
+            return (cached.path == req.path) && (cached.page == req.page) && (cached.annotations == req.should_render_annotations);
+            });
+        if (it == display_lists.end()) break;
+        if (it->list) {
+            it->last_use = ++display_list_uses;
+            return fz_keep_display_list(ctx, it->list);
+        }
+        // another thread is making it
+        display_lists_cv.wait(lock);
+    }
+    if (!make_if_missing) {
+        return nullptr;
+    }
+
+    CachedDisplayList placeholder;
+    placeholder.path = req.path;
+    placeholder.page = req.page;
+    placeholder.annotations = req.should_render_annotations;
+    placeholder.last_use = ++display_list_uses;
+    display_lists.push_back(placeholder);
+    unsigned long long generation = display_list_generation;
+    lock.unlock();
+
+    fz_display_list* list = nullptr;
+    fz_page* page = nullptr;
+    bool failed = false;
+    fz_var(list);
+    fz_var(page);
+    fz_try(ctx) {
+        page = fz_load_page(ctx, doc, req.page);
+        if (req.should_render_annotations) {
+            list = fz_new_display_list_from_page(ctx, page);
+        }
+        else {
+            list = fz_new_display_list_from_page_contents(ctx, page);
+        }
+    }
+    fz_always(ctx) {
+        fz_drop_page(ctx, page);
+    }
+    fz_catch(ctx) {
+        failed = true;
+    }
+
+    lock.lock();
+    auto it = std::find_if(display_lists.begin(), display_lists.end(), [&](const CachedDisplayList& cached) {
+        return (cached.path == req.path) && (cached.page == req.page) && (cached.annotations == req.should_render_annotations) && (cached.list == nullptr);
+        });
+    if (failed || (generation != display_list_generation)) {
+        // not cached: it failed, or the cache was cleared meanwhile (the document may have changed)
+        if (it != display_lists.end()) display_lists.erase(it);
+    }
+    else {
+        if (it != display_lists.end()) it->list = fz_keep_display_list(ctx, list);
+        // evict the least recently used lists (not ones being made)
+        while (display_lists.size() > max_cached_lists) {
+            auto oldest = display_lists.end();
+            for (auto candidate = display_lists.begin(); candidate != display_lists.end(); candidate++) {
+                if (candidate->list && ((oldest == display_lists.end()) || (candidate->last_use < oldest->last_use))) {
+                    oldest = candidate;
+                }
+            }
+            if (oldest == display_lists.end()) break;
+            fz_drop_display_list(ctx, oldest->list);
+            display_lists.erase(oldest);
+        }
+    }
+    display_lists_cv.notify_all();
+    lock.unlock();
+
+    // (not thrown: that would skip the destructors of this function's locals; without a list the page
+    // is drawn directly, which reports the error)
+    return failed ? nullptr : list;
+}
+
+void PdfRenderer::drop_display_lists(const std::wstring* path) {
+    std::lock_guard<std::mutex> lock(display_lists_mutex);
+    display_list_generation++;
+    for (int i = static_cast<int>(display_lists.size()) - 1; i >= 0; i--) {
+        if (path && (display_lists[i].path != *path)) continue;
+        // lists being made are erased by the thread making them (the generation changed)
+        if (display_lists[i].list == nullptr) continue;
+        fz_drop_display_list(context_to_clone, display_lists[i].list);
+        display_lists.erase(display_lists.begin() + i);
+    }
 }
 
 GLuint PdfRenderer::find_closest_rendered_page(std::wstring path, int page, bool should_render_annotations, int index, int num_h_slices, int num_v_slices, float zoom_level, float display_scale, int* page_width, int* page_height) {
@@ -560,6 +686,11 @@ void PdfRenderer::delete_old_pages(bool force_all, bool invalidate_all) {
             indices_to_delete.push_back(i);
         }
         are_documents_invalidated = true;
+    }
+
+    if (force_all || invalidate_all) {
+        // the document may have changed (or is being closed)
+        drop_display_lists();
     }
     else {
         // We never delete the most recently used responses that add up to num_cached_pages pages. A
@@ -872,15 +1003,22 @@ void PdfRenderer::run(int thread_index) {
 
             // -1 until this worker counts as rendering
             int helpers = -1;
+            fz_display_list* page_list = nullptr;
             fz_var(helpers);
+            fz_var(page_list);
             fz_try(mupdf_context) {
                 fz_document* doc = get_document_with_path(thread_index, mupdf_context, req.path);
+
+                // Tiles and slices of a page are drawn from its display list, so that its contents are
+                // interpreted once rather than for every tile (on pages with many paths that is most of
+                // the time). A whole page uses the list if there is one.
+                page_list = get_page_display_list(mupdf_context, doc, req, req.slice_index != -1);
 
                 rendering_workers++;
                 helpers = acquire_band_helpers(req);
                 auto render_begin = std::chrono::steady_clock::now();
                 int bands_used = 1;
-                fz_pixmap* rendered_pixmap = render_request_pixmap(mupdf_context, doc, req, helpers, &bands_used);
+                fz_pixmap* rendered_pixmap = render_request_pixmap(mupdf_context, doc, req, helpers, &bands_used, page_list);
                 float elapsed_ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - render_begin).count();
                 update_render_cost_estimate(req.path, rendered_pixmap, elapsed_ms, bands_used);
                 release_band_helpers(helpers);
@@ -906,13 +1044,27 @@ void PdfRenderer::run(int thread_index) {
                 emit render_advance();
 
             }
+            fz_always(mupdf_context) {
+                fz_drop_display_list(mupdf_context, page_list);
+            }
             fz_catch(mupdf_context) {
                 // helpers is -1 when the render itself succeeded and the counters were already updated
                 if (helpers >= 0) {
                     release_band_helpers(helpers);
                     rendering_workers--;
                 }
-                std::cerr << "Error: could not render page" << std::endl;
+                // Keep the entry as failed: while it is cached, the page is drawn from the closest texture
+                // there is and not rendered again (removing it would render it again every frame).
+                cached_response_mutex.lock();
+                int index = get_pending_response_index_with_thread_index(req, thread_index);
+                if (index >= 0) {
+                    cached_responses[index].pending = false;
+                    cached_responses[index].failed = true;
+                    cached_responses[index].last_access_time = QDateTime::currentMSecsSinceEpoch();
+                }
+                cached_response_mutex.unlock();
+                emit render_advance();
+                std::cerr << "Error: could not render page: " << fz_caught_message(mupdf_context) << std::endl;
             }
         }
         thread_rendering_mutex[thread_index].unlock();

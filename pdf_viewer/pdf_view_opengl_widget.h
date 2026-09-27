@@ -6,6 +6,9 @@
 #include <optional>
 #include <utility>
 #include <array>
+#include <map>
+#include <chrono>
+#include <qtimer.h>
 
 //#include <qopenglfunctions_3_1.h>
 #include <qopenglwidget.h>
@@ -126,6 +129,16 @@ private:
     bool should_show_rect_hints = false;
     ColorPalette color_mode = ColorPalette::Normal;
     bool is_helper = false;
+
+    // The zoom level is changing continuously (e.g. while pinching): a change came shortly after the
+    // previous one. Nothing is rendered until it has been still for a moment (zoom_settle_timer then
+    // draws a frame, which requests the pages at the final zoom level).
+    bool is_zooming_continuously = false;
+    float last_frame_zoom_level = -1;
+    std::chrono::steady_clock::time_point last_zoom_change_time;
+    QTimer zoom_settle_timer;
+    // for each (document, page) drawn in tiles, the last zoom level whose visible tiles were all rendered
+    std::map<std::pair<std::wstring, int>, float> last_sharp_tile_zoom;
     float percent_done = 0.0f;
     std::string tag_prefix = "";
     std::vector<std::string> highlighted_tags;
@@ -251,7 +264,11 @@ public:
     void render_overview(OverviewState overview);
     void render_page(int page_number, bool in_overview=false, ColorPalette forced_palette=ColorPalette::None, bool stencils_allowed=true);
     bool should_tile_page(int page_number, float zoom_level, float* base_zoom_level);
-    void render_page_tiles(int page_number, float zoom_level, float device_pixel_ratio, ColorPalette forced_palette);
+    void render_page_tiles(int page_number, float zoom_level, float device_pixel_ratio, ColorPalette forced_palette, bool request_renders);
+    bool draw_page_tiles(int page_number, float tile_zoom_level, float zoom_level, float device_pixel_ratio, ColorPalette forced_palette, bool request_renders);
+    void draw_closest_slices(int page_number, float zoom_level, ColorPalette forced_palette);
+    // updates is_zooming_continuously for the frame about to be drawn
+    void update_zoom_state();
     bool get_is_searching(float* prog);
     void search_text(const std::wstring& text, SearchCaseSensitivity case_sensitive = SearchCaseSensitivity::CaseInsensitive, bool regex = false, std::optional<std::pair<int, int>> range = {});
     void set_dark_mode(bool mode);
