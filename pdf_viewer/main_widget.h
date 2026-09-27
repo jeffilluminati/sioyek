@@ -651,6 +651,7 @@ public:
 
     void handle_vertical_move(int amount);
     void handle_horizontal_move(int amount);
+    void handle_horizontal_move_half_page(int amount);
     void handle_goto_portal_list();
     void handle_goto_bookmark();
     void handle_show_marks();
@@ -662,6 +663,7 @@ public:
     void handle_open_prev_doc();
     void handle_open_all_docs();
     void handle_move_screen(int amount);
+    void handle_move_screen_page_aware(int amount);
     MainWidget* handle_new_window();
     void handle_open_link(const std::wstring& text, bool copy = false);
     void handle_overview_link(const std::wstring& text);

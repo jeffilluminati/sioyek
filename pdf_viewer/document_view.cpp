@@ -1138,6 +1138,68 @@ float DocumentView::view_height_in_document_space() {
     return static_cast<float>(view_height) / zoom_level;
 }
 
+// Vertical distance (in document space) to move one screen in `direction` (1 = down, -1 = up)
+// without skipping over a page boundary: if the page at the edge of the screen continues past it,
+// move a screen but stop where that page ends, otherwise align that page with the edge of the screen.
+float DocumentView::get_page_aware_screen_move_amount(int direction) {
+    float view_h = view_height_in_document_space();
+    if (!current_document) return direction * view_h;
+
+    // vertical extent of each row of pages in virtual space (in two page mode a row has two pages)
+    std::vector<std::pair<float, float>> rows;
+    if (fast_coordinates()) {
+        int num_pages = current_document->num_pages();
+        for (int i = 0; i < num_pages; i++) {
+            float page_height = current_document->get_page_height(i);
+            if (page_height < 0) return direction * view_h;
+            float top = current_document->get_accum_page_height(i);
+            rows.push_back({ top, top + page_height });
+        }
+    }
+    else {
+        fill_cached_virtual_rects();
+        for (const auto& rect : cached_virtual_rects) {
+            if (rows.size() > 0 && rows.back().first == rect.y0) {
+                rows.back().second = std::max(rows.back().second, rect.y1);
+            }
+            else {
+                rows.push_back({ rect.y0, rect.y1 });
+            }
+        }
+    }
+
+    float view_top = offset.y - view_h / 2;
+    float view_bottom = offset.y + view_h / 2;
+    // ignore page edges that are within a couple of pixels of the screen edge
+    float eps = 2.0f / zoom_level;
+
+    if (direction > 0) {
+        // first row that continues below the screen
+        for (const auto& [top, bottom] : rows) {
+            if (bottom > view_bottom + eps) {
+                if (top < view_top + eps) {
+                    return std::min(view_h, bottom - view_bottom);
+                }
+                return top - view_top;
+            }
+        }
+    }
+    else {
+        // last row that continues above the screen
+        for (int i = rows.size() - 1; i >= 0; i--) {
+            auto [top, bottom] = rows[i];
+            if (top < view_top - eps) {
+                if (bottom > view_bottom - eps) {
+                    return -std::min(view_h, view_top - top);
+                }
+                return bottom - view_bottom;
+            }
+        }
+    }
+
+    return direction * view_h;
+}
+
 void DocumentView::set_vertical_line_pos(float pos) {
     ruler_pos = pos;
     ruler_rect = {};

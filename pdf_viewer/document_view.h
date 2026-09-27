@@ -189,6 +189,7 @@ public:
     void get_page_chapter_index(int page, std::vector<TocNode*> toc_nodes, std::vector<int>& res);
     std::vector<int> get_current_chapter_recursive_index();
     float view_height_in_document_space();
+    float get_page_aware_screen_move_amount(int direction);
     void set_vertical_line_pos(float pos);
     bool has_ruler_rect();
     std::optional<AbsoluteRect> get_ruler_rect();

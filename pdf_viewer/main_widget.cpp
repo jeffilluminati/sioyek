@@ -5959,6 +5959,26 @@ void MainWidget::handle_horizontal_move(int amount) {
     }
 }
 
+void MainWidget::handle_horizontal_move_half_page(int amount) {
+    if (opengl_widget->get_overview_page()) {
+        return;
+    }
+    else if (main_document_view->is_presentation_mode()) {
+        main_document_view->move_pages(-amount);
+        validate_render();
+    }
+    else {
+        Document* doc = dv()->get_document();
+        int page = dv()->get_center_page_number();
+        if (doc == nullptr || page < 0) return;
+
+        float half_page_width = doc->get_page_width(page) / 2;
+        if (half_page_width <= 0) return;
+        dv()->move(amount * half_page_width * dv()->get_zoom_level(), 0.0f);
+        last_smart_fit_page = {};
+    }
+}
+
 void MainWidget::show_current_widget() {
     if (current_widget_stack.size() > 0) {
         current_widget_stack.back()->show();
@@ -6452,6 +6472,19 @@ void MainWidget::handle_move_screen(int amount) {
     }
     else {
         main_document_view->move_pages(amount);
+    }
+}
+
+void MainWidget::handle_move_screen_page_aware(int amount) {
+    if (main_document_view->is_presentation_mode()) {
+        main_document_view->move_pages(amount);
+        return;
+    }
+
+    int direction = amount > 0 ? 1 : -1;
+    for (int i = 0; i < std::abs(amount); i++) {
+        float move_amount = dv()->get_page_aware_screen_move_amount(direction);
+        move_document(0, move_amount * dv()->get_zoom_level());
     }
 }
 
