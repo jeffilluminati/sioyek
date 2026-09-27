@@ -7,7 +7,22 @@
 
 #include <cmath>
 #include <cassert>
+#include <cstdint>
+#include <cwchar>
 #include "utils.h"
+
+// SIMD filtering for search_text_with_index
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#define SIOYEK_SEARCH_NEON
+#elif defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && (_M_IX86_FP >= 2))
+#include <emmintrin.h>
+#define SIOYEK_SEARCH_SSE2
+#endif
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
 #include <optional>
 #include <functional>
 #include <cstring>
@@ -498,34 +513,67 @@ std::vector<fz_stext_char*> reorder_mixed_stext_line(fz_stext_line* line) {
     return chars;
 }
 
-std::vector<fz_stext_char*> reorder_stext_line(fz_stext_line* line) {
+// Appends the characters of `line` to `chars` in visual order.
+static void append_reordered_stext_line(fz_stext_line* line, std::vector<fz_stext_char*>& chars) {
+    size_t begin = chars.size();
 
-    std::vector<fz_stext_char*> reordered_chars;
-
-    bool rtl = is_stext_line_rtl(line);
+    float rtl_count = 0.0f;
+    float total_count = 0.0f;
+    bool increasing = true;
+    bool decreasing = true;
+    fz_stext_char* prev = nullptr;
 
     LL_ITER(ch, line->first_char) {
-        reordered_chars.push_back(ch);
+        if (is_rtl(ch->c)) {
+            rtl_count += 1.0f;
+        }
+        total_count += 1.0f;
+        if (prev) {
+            increasing = increasing && (prev->quad.lr.x < ch->quad.lr.x);
+            decreasing = decreasing && (prev->quad.lr.x > ch->quad.lr.x);
+        }
+        prev = ch;
+        chars.push_back(ch);
     }
 
+    // same as is_stext_line_rtl
+    bool rtl = (rtl_count / total_count) > 0.5f;
+
+    // Most lines are already in visual order. When the characters are strictly monotonic in
+    // `lr.x`, none of the comparisons below between a later and an earlier character is true, so
+    // the stable sort would not move anything and we can skip it (and its temporary buffer).
     if (rtl) {
-        std::stable_sort(reordered_chars.begin(), reordered_chars.end(), [](fz_stext_char* lhs, fz_stext_char* rhs) {
-            return lhs->quad.lr.x >= rhs->quad.lr.x;
-            });
+        if (!decreasing) {
+            std::stable_sort(chars.begin() + begin, chars.end(), [](fz_stext_char* lhs, fz_stext_char* rhs) {
+                return lhs->quad.lr.x >= rhs->quad.lr.x;
+                });
+        }
     }
     else {
-        std::stable_sort(reordered_chars.begin(), reordered_chars.end(), [](fz_stext_char* lhs, fz_stext_char* rhs) {
-            return (lhs->quad.lr.x <= rhs->quad.lr.x) && (lhs->quad.ll.x < rhs->quad.ll.x);
-            });
+        if (!increasing) {
+            std::stable_sort(chars.begin() + begin, chars.end(), [](fz_stext_char* lhs, fz_stext_char* rhs) {
+                return (lhs->quad.lr.x <= rhs->quad.lr.x) && (lhs->quad.ll.x < rhs->quad.ll.x);
+                });
+        }
     }
+}
+
+std::vector<fz_stext_char*> reorder_stext_line(fz_stext_line* line) {
+    std::vector<fz_stext_char*> reordered_chars;
+    append_reordered_stext_line(line, reordered_chars);
     return reordered_chars;
 }
 
 void get_flat_chars_from_block(fz_stext_block* block, std::vector<fz_stext_char*>& flat_chars, bool dehyphenate) {
     if (block->type == FZ_STEXT_BLOCK_TEXT) {
         LL_ITER(line, block->u.t.first_line) {
-            std::vector<fz_stext_char*> reordered_chars = reorder_stext_line(line);
-            for (auto ch : reordered_chars) {
+            // reorder the line in place at the end of flat_chars instead of in a temporary vector
+            size_t line_begin = flat_chars.size();
+            append_reordered_stext_line(line, flat_chars);
+
+            size_t out = line_begin;
+            for (size_t i = line_begin; i < flat_chars.size(); i++) {
+                fz_stext_char* ch = flat_chars[i];
                 if (ch->c == 65533) {
                     // unicode replacement character https://www.fileformat.info/info/unicode/char/fffd/index.htm
                     ch->c = ' ';
@@ -537,8 +585,9 @@ void get_flat_chars_from_block(fz_stext_block* block, std::vector<fz_stext_char*
                     }
                 }
 
-                flat_chars.push_back(ch);
+                flat_chars[out++] = ch;
             }
+            flat_chars.resize(out);
         }
     }
 }
@@ -682,8 +731,7 @@ void get_flat_chars_from_stext_page(fz_stext_page* stext_page, std::vector<fz_st
 }
 
 bool is_delimeter(int c) {
-    std::vector<char> delimeters = { ' ', '\n', ';', ',' };
-    return std::find(delimeters.begin(), delimeters.end(), c) != delimeters.end();
+    return (c == ' ') || (c == '\n') || (c == ';') || (c == ',');
 }
 
 float get_character_height(fz_stext_char* c) {
@@ -1325,21 +1373,22 @@ std::vector<std::wstring> find_all_regex_matches(std::wstring haystack,
     std::wregex regex(regex_string);
     std::wsmatch match;
     std::vector<std::wstring> res;
-    int skipped_length = 0;
 
-    while (std::regex_search(haystack, match, regex)) {
+    // Searching [search_start, end) with the default flags treats search_start as the beginning of the
+    // input (e.g. for `^`), exactly like searching a copy of the suffix did, but without copying it.
+    std::wstring::const_iterator search_start = haystack.cbegin();
+    while (std::regex_search(search_start, haystack.cend(), match, regex)) {
         for (size_t i = 0; i < match.size(); i++) {
             if (match[i].matched) {
                 res.push_back(match[i].str());
                 if (match_ranges) {
-                    int begin_index = match[i].first - haystack.begin();
+                    int begin_index = match[i].first - haystack.cbegin();
                     int match_length = match[i].length();
-                    match_ranges->push_back(std::make_pair(skipped_length + begin_index, skipped_length + begin_index + match_length-1));
+                    match_ranges->push_back(std::make_pair(begin_index, begin_index + match_length-1));
                 }
             }
         }
-        skipped_length += match.prefix().length() + match.length();
-        haystack = match.suffix();
+        search_start = match[0].second;
     }
     return res;
 
@@ -1356,19 +1405,80 @@ void find_regex_matches_in_stext_page(const std::vector<fz_stext_char*>& flat_ch
 
     std::wsmatch match;
 
-    int offset = 0;
-    while (std::regex_search(page_string, match, regex)) {
-        int start_index = offset + match.position();
+    std::wstring::const_iterator search_start = page_string.cbegin();
+    while (std::regex_search(search_start, page_string.cend(), match, regex)) {
+        int start_index = match[0].first - page_string.cbegin();
         int end_index = start_index + match.length() - 1;
         match_ranges.push_back(std::make_pair(indices[start_index], indices[end_index]));
         match_texts.push_back(match.str());
-
-        int old_length = page_string.size();
-        page_string = match.suffix();
-        int new_length = page_string.size();
-
-        offset += (old_length - new_length);
+        search_start = match[0].second;
     }
+}
+
+static bool is_ascii_digit(wchar_t c) {
+    return (c >= '0') && (c <= '9');
+}
+
+static bool is_ascii_letter(wchar_t c) {
+    return ((c >= 'a') && (c <= 'z')) || ((c >= 'A') && (c <= 'Z'));
+}
+
+// Returns the end of the match of "[0-9]+(\.[0-9]+)*" at `pos`, or npos if there is none. None of the
+// quantified parts can give characters back to what follows them, so greedily consuming is the only
+// way the regex can match.
+static size_t match_dotted_number(const std::wstring& str, size_t pos) {
+    size_t n = str.size();
+    size_t i = pos;
+    while (i < n && is_ascii_digit(str[i])) i++;
+    if (i == pos) return std::wstring::npos;
+
+    while ((i + 1 < n) && (str[i] == '.') && is_ascii_digit(str[i + 1])) {
+        i += 2;
+        while (i < n && is_ascii_digit(str[i])) i++;
+    }
+    return i;
+}
+
+// Equivalent to find_regex_matches_in_stext_page with the regex "\([0-9]+(\.[0-9]+)*\)", which is
+// what index_equations used for every page. std::wregex is very slow and allocation heavy.
+static void find_equation_reference_matches(const std::vector<fz_stext_char*>& flat_chars,
+    std::vector<std::pair<int, int>>& match_ranges, std::vector<std::wstring>& match_texts) {
+
+    std::wstring page_string;
+    std::vector<int> indices;
+
+    get_text_from_flat_chars(flat_chars, page_string, indices);
+
+    size_t pos = page_string.find(L'(');
+    while (pos != std::wstring::npos) {
+        size_t number_end = match_dotted_number(page_string, pos + 1);
+        if ((number_end != std::wstring::npos) && (number_end < page_string.size()) && (page_string[number_end] == ')')) {
+            match_ranges.push_back(std::make_pair(indices[pos], indices[number_end]));
+            match_texts.push_back(page_string.substr(pos, number_end - pos + 1));
+            pos = page_string.find(L'(', number_end + 1);
+        }
+        else {
+            pos = page_string.find(L'(', pos + 1);
+        }
+    }
+}
+
+// Returns the end of the match of "[A-Z][a-zA-Z]{2,}\.?[ \t]+[0-9]+(\.[0-9]+)*" at `pos`, or npos.
+static size_t match_generic_index_item(const std::wstring& str, size_t pos) {
+    size_t n = str.size();
+    if (pos >= n || str[pos] < 'A' || str[pos] > 'Z') return std::wstring::npos;
+
+    size_t i = pos + 1;
+    while (i < n && is_ascii_letter(str[i])) i++;
+    if (i - (pos + 1) < 2) return std::wstring::npos;
+
+    if (i < n && str[i] == '.') i++;
+
+    size_t whitespace_begin = i;
+    while (i < n && (str[i] == ' ' || str[i] == '\t')) i++;
+    if (i == whitespace_begin) return std::wstring::npos;
+
+    return match_dotted_number(str, i);
 }
 
 bool are_stext_chars_far_enough_for_equation(fz_stext_char* first, fz_stext_char* second) {
@@ -1414,54 +1524,69 @@ std::wstring strip_string(std::wstring& input_string) {
 void index_generic(const std::vector<fz_stext_char*>& flat_chars, int page_number, std::vector<IndexedData>& indices) {
 
     std::wstring page_string;
-    std::vector<std::optional<fz_rect>> page_rects;
+    // index of the flat char of each character of page_string (-1 for the inserted newlines)
+    std::vector<int> char_indices;
+    page_string.reserve(flat_chars.size() + flat_chars.size() / 16);
+    char_indices.reserve(flat_chars.size() + flat_chars.size() / 16);
 
-    for (auto ch : flat_chars) {
+    for (size_t i = 0; i < flat_chars.size(); i++) {
+        fz_stext_char* ch = flat_chars[i];
         page_string.push_back(ch->c);
-        page_rects.push_back(fz_rect_from_quad(ch->quad));
+        char_indices.push_back(i);
         if (ch->next == nullptr) {
             page_string.push_back('\n');
-            page_rects.push_back({});
+            char_indices.push_back(-1);
         }
     }
 
-    std::wregex index_dst_regex(L"(^|\n)[A-Z][a-zA-Z]{2,}\\.?[ \t]+[0-9]+(\\.[0-9]+)*");
-    //std::wregex index_dst_regex(L"(^|\n)[A-Z][a-zA-Z]{2,}[ \t]+[0-9]+(\-[0-9]+)*");
-    //std::wregex index_src_regex(L"[a-zA-Z]{3,}[ \t]+[0-9]+(\.[0-9]+)*");
-    std::wsmatch match;
-
-
-    int offset = 0;
-    while (std::regex_search(page_string, match, index_dst_regex)) {
+    // This finds the same matches as repeatedly searching the rest of the page for the regex
+    // "(^|\n)[A-Z][a-zA-Z]{2,}\.?[ \t]+[0-9]+(\.[0-9]+)*" did. Just like `^` did in the rest of the
+    // page, an item can start right at the end of the previous match without a newline.
+    size_t search_start = 0;
+    while (search_start < page_string.size()) {
+        size_t match_begin = std::wstring::npos;
+        size_t match_end = match_generic_index_item(page_string, search_start);
+        if (match_end != std::wstring::npos) {
+            match_begin = search_start;
+        }
+        else {
+            size_t newline = page_string.find(L'\n', search_start);
+            while (newline != std::wstring::npos) {
+                match_end = match_generic_index_item(page_string, newline + 1);
+                if (match_end != std::wstring::npos) {
+                    match_begin = newline;
+                    break;
+                }
+                newline = page_string.find(L'\n', newline + 1);
+            }
+        }
+        if (match_begin == std::wstring::npos) {
+            break;
+        }
 
         IndexedData new_data;
         new_data.page = page_number;
-        std::wstring match_string = match.str();
+        std::wstring match_string = page_string.substr(match_begin, match_end - match_begin);
         new_data.text = strip_string(match_string);
         new_data.y_offset = 0.0f;
 
-        int match_start_index = match.position();
-        int match_size = match_string.size();
-        for (int i = 0; i < match_size; i++) {
-            int index = offset + match_start_index + i;
-            if (page_rects[index]) {
-                new_data.y_offset = page_rects[index].value().y0;
+        for (size_t index = match_begin; index < match_end; index++) {
+            if (char_indices[index] >= 0) {
+                new_data.y_offset = fz_rect_from_quad(flat_chars[char_indices[index]]->quad).y0;
                 break;
             }
         }
-        offset += match_start_index + match_size;
-        page_string = match.suffix();
+        search_start = match_end;
 
         indices.push_back(new_data);
     }
 }
 
 void index_equations(const std::vector<fz_stext_char*>& flat_chars, int page_number, std::map<std::wstring, std::vector<IndexedData>>& indices) {
-    std::wregex regex(L"\\([0-9]+(\\.[0-9]+)*\\)");
     std::vector<std::pair<int, int>> match_ranges;
     std::vector<std::wstring> match_texts;
 
-    find_regex_matches_in_stext_page(flat_chars, regex, match_ranges, match_texts);
+    find_equation_reference_matches(flat_chars, match_ranges, match_texts);
 
     for (size_t i = 0; i < match_ranges.size(); i++) {
         auto [start_index, end_index] = match_ranges[i];
@@ -2277,13 +2402,13 @@ bool is_string_titlish(const std::wstring& str) {
     if (str.size() <= 5 || str.size() >= 60) {
         return false;
     }
-    std::wregex regex(L"([0-9IVXC]+\\.)+([0-9IVXC]+)*");
-    std::wsmatch match;
-
-    std::regex_search(str, match, regex);
-    int pos = match.position();
-    int size = match.length();
-    return (size > 0) && (pos == 0);
+    // equivalent to the regex "([0-9IVXC]+\.)+([0-9IVXC]+)*" matching at the start of the string
+    auto is_numeral = [](wchar_t c) {
+        return is_ascii_digit(c) || (c == 'I') || (c == 'V') || (c == 'X') || (c == 'C');
+    };
+    size_t i = 0;
+    while (i < str.size() && is_numeral(str[i])) i++;
+    return (i > 0) && (i < str.size()) && (str[i] == '.');
 }
 
 bool is_title_parent_of(const std::wstring& parent_title, const std::wstring& child_title, bool* are_same) {
@@ -3928,6 +4053,197 @@ std::function<wchar_t(const wchar_t&)> get_hash(SearchCaseSensitivity cs, const 
     return case_sensitive_hash;
 }
 
+namespace {
+
+// The set of characters that can match one character of the query under the search predicate:
+// `a` and `b`, plus every non ASCII character if `any_non_ascii` is set.
+struct SearchCharFilter {
+    uint32_t a;
+    uint32_t b;
+    bool any_non_ascii;
+};
+
+// Returns false if the matching characters can't be described by a SearchCharFilter.
+bool make_search_char_filter(wchar_t query_char, bool case_insensitive, SearchCharFilter* filter) {
+    if (!case_insensitive) {
+        filter->a = filter->b = static_cast<uint32_t>(query_char);
+        filter->any_non_ascii = false;
+        return true;
+    }
+
+    // Case insensitive matching uses the locale's tolower, which can map non ASCII characters to ASCII
+    // ones (e.g. the Kelvin sign to 'k'), so non ASCII characters are always candidates and are
+    // verified with the predicate itself. The ASCII candidates are computed with the same predicate.
+    std::vector<uint32_t> ascii_matches;
+    for (int c = 0; c < 128; c++) {
+        if (pred_case_insensitive(static_cast<wchar_t>(c), query_char)) {
+            ascii_matches.push_back(c);
+        }
+    }
+    if (ascii_matches.size() > 2) {
+        return false;
+    }
+    // if there are no ASCII candidates use a non ASCII value, those are candidates anyway
+    uint32_t fallback = 0xFFFFFFFFu;
+    filter->a = ascii_matches.size() > 0 ? ascii_matches[0] : fallback;
+    filter->b = ascii_matches.size() > 1 ? ascii_matches[1] : filter->a;
+    filter->any_non_ascii = true;
+    return true;
+}
+
+#if defined(SIOYEK_SEARCH_NEON) || defined(SIOYEK_SEARCH_SSE2)
+#define SIOYEK_SEARCH_SIMD
+
+// Returns a 16 byte vector where byte i is 0xFF if text[i] passes `filter` and 0 otherwise.
+#ifdef SIOYEK_SEARCH_NEON
+inline uint8x16_t search_candidates16(const wchar_t* text, const SearchCharFilter& filter) {
+    if constexpr (sizeof(wchar_t) == 4) {
+        const uint32_t* p = reinterpret_cast<const uint32_t*>(text);
+        uint32x4_t a = vdupq_n_u32(filter.a);
+        uint32x4_t b = vdupq_n_u32(filter.b);
+        uint32x4_t max_ascii = vdupq_n_u32(filter.any_non_ascii ? 127 : 0xFFFFFFFFu);
+        uint16x4_t m[4];
+        for (int k = 0; k < 4; k++) {
+            uint32x4_t x = vld1q_u32(p + 4 * k);
+            uint32x4_t hit = vorrq_u32(vorrq_u32(vceqq_u32(x, a), vceqq_u32(x, b)), vcgtq_u32(x, max_ascii));
+            m[k] = vmovn_u32(hit);
+        }
+        return vcombine_u8(vmovn_u16(vcombine_u16(m[0], m[1])), vmovn_u16(vcombine_u16(m[2], m[3])));
+    }
+    else {
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(text);
+        uint16x8_t a = vdupq_n_u16(static_cast<uint16_t>(filter.a));
+        uint16x8_t b = vdupq_n_u16(static_cast<uint16_t>(filter.b));
+        uint16x8_t max_ascii = vdupq_n_u16(filter.any_non_ascii ? 127 : 0xFFFF);
+        uint8x8_t m[2];
+        for (int k = 0; k < 2; k++) {
+            uint16x8_t x = vld1q_u16(p + 8 * k);
+            uint16x8_t hit = vorrq_u16(vorrq_u16(vceqq_u16(x, a), vceqq_u16(x, b)), vcgtq_u16(x, max_ascii));
+            m[k] = vmovn_u16(hit);
+        }
+        return vcombine_u8(m[0], m[1]);
+    }
+}
+
+inline uint32_t search_candidates_mask(uint8x16_t candidates) {
+    if (vmaxvq_u8(candidates) == 0) return 0;
+    static const uint8_t bit_values[16] = { 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128 };
+    uint8x16_t bits = vandq_u8(candidates, vld1q_u8(bit_values));
+    return vaddv_u8(vget_low_u8(bits)) | (static_cast<uint32_t>(vaddv_u8(vget_high_u8(bits))) << 8);
+}
+#else
+inline __m128i search_candidates16(const wchar_t* text, const SearchCharFilter& filter) {
+    const __m128i* p = reinterpret_cast<const __m128i*>(text);
+    if constexpr (sizeof(wchar_t) == 4) {
+        __m128i a = _mm_set1_epi32(static_cast<int>(filter.a));
+        __m128i b = _mm_set1_epi32(static_cast<int>(filter.b));
+        __m128i non_ascii_bits = _mm_set1_epi32(filter.any_non_ascii ? ~0x7F : 0);
+        __m128i m[4];
+        for (int k = 0; k < 4; k++) {
+            __m128i x = _mm_loadu_si128(p + k);
+            __m128i hit = _mm_or_si128(_mm_cmpeq_epi32(x, a), _mm_cmpeq_epi32(x, b));
+            __m128i ascii = _mm_cmpeq_epi32(_mm_and_si128(x, non_ascii_bits), _mm_setzero_si128());
+            m[k] = _mm_or_si128(hit, _mm_andnot_si128(ascii, _mm_set1_epi32(-1)));
+        }
+        return _mm_packs_epi16(_mm_packs_epi32(m[0], m[1]), _mm_packs_epi32(m[2], m[3]));
+    }
+    else {
+        __m128i a = _mm_set1_epi16(static_cast<short>(filter.a));
+        __m128i b = _mm_set1_epi16(static_cast<short>(filter.b));
+        __m128i non_ascii_bits = _mm_set1_epi16(filter.any_non_ascii ? static_cast<short>(~0x7F) : 0);
+        __m128i m[2];
+        for (int k = 0; k < 2; k++) {
+            __m128i x = _mm_loadu_si128(p + k);
+            __m128i hit = _mm_or_si128(_mm_cmpeq_epi16(x, a), _mm_cmpeq_epi16(x, b));
+            __m128i ascii = _mm_cmpeq_epi16(_mm_and_si128(x, non_ascii_bits), _mm_setzero_si128());
+            m[k] = _mm_or_si128(hit, _mm_andnot_si128(ascii, _mm_set1_epi16(-1)));
+        }
+        return _mm_packs_epi16(m[0], m[1]);
+    }
+}
+
+inline uint32_t search_candidates_mask(__m128i candidates) {
+    return static_cast<uint32_t>(_mm_movemask_epi8(candidates));
+}
+#endif
+
+inline uint32_t search_candidates_and_mask(const wchar_t* first, const wchar_t* last,
+    const SearchCharFilter& first_filter, const SearchCharFilter& last_filter) {
+#ifdef SIOYEK_SEARCH_NEON
+    return search_candidates_mask(vandq_u8(search_candidates16(first, first_filter), search_candidates16(last, last_filter)));
+#else
+    return search_candidates_mask(_mm_and_si128(search_candidates16(first, first_filter), search_candidates16(last, last_filter)));
+#endif
+}
+
+inline int count_trailing_zeros(uint32_t x) {
+#ifdef _MSC_VER
+    unsigned long index;
+    _BitScanForward(&index, x);
+    return static_cast<int>(index);
+#else
+    return __builtin_ctz(x);
+#endif
+}
+#endif
+
+// Calls on_match(position) in increasing order for every (possibly overlapping) occurrence of `query`
+// in `text` that starts in [begin, end). This gives the same matches as repeatedly calling std::search
+// with pred_case_sensitive / pred_case_insensitive. Instead of a Boyer-Moore search (whose skip table
+// for wchar_t is a hash map), 16 positions at a time are filtered with SIMD by comparing the first and
+// last characters of the query, and only the remaining candidates are compared in full.
+template <typename OnMatch>
+void find_all_occurrences(const std::wstring& text, size_t begin, size_t end, const std::wstring& query, bool case_insensitive, OnMatch on_match) {
+    const size_t m = query.size();
+    const wchar_t* t = text.data();
+    const wchar_t* q = query.data();
+
+    size_t last_start = 0; // exclusive upper bound of the start positions
+    if (m == 0) {
+        last_start = std::min(end, text.size());
+    }
+    else if (text.size() >= m) {
+        last_start = std::min(end, text.size() - m + 1);
+    }
+
+    auto matches_at = [&](size_t pos) {
+        if (case_insensitive) {
+            for (size_t j = 0; j < m; j++) {
+                if (!pred_case_insensitive(t[pos + j], q[j])) return false;
+            }
+            return true;
+        }
+        return std::wmemcmp(t + pos, q, m) == 0;
+    };
+
+    size_t i = begin;
+
+#ifdef SIOYEK_SEARCH_SIMD
+    SearchCharFilter first_filter, last_filter;
+    if (m > 0 && make_search_char_filter(q[0], case_insensitive, &first_filter) && make_search_char_filter(q[m - 1], case_insensitive, &last_filter)) {
+        // reads t[i .. i + 15] and t[i + m - 1 .. i + m + 14], which are valid since i + 16 <= text.size() - m + 1
+        for (; i + 16 <= last_start; i += 16) {
+            uint32_t mask = search_candidates_and_mask(t + i, t + i + m - 1, first_filter, last_filter);
+            while (mask) {
+                size_t pos = i + count_trailing_zeros(mask);
+                if (matches_at(pos)) {
+                    on_match(pos);
+                }
+                mask &= mask - 1;
+            }
+        }
+    }
+#endif
+
+    for (; i < last_start; i++) {
+        if (matches_at(i)) {
+            on_match(i);
+        }
+    }
+}
+
+} // namespace
+
 std::vector<SearchResult> search_text_with_index(const std::wstring& super_fast_search_index,
     const std::vector<int>& page_begin_indices,
     const std::wstring& query,
@@ -3951,26 +4267,15 @@ std::vector<SearchResult> search_text_with_index(const std::wstring& super_fast_
     int end_index = max_page == page_begin_indices.size()-1? super_fast_search_index.size() : page_begin_indices[max_page+1];
     bool is_before = true;
 
-    auto pred = get_pred(case_sensitive, query);
-    auto hash = get_hash(case_sensitive, query);
-#ifdef SIOYEK_ANDROID
-    // for some reason at the time of this commit std::boyer_moore_searcher doesn't
-    // compile on android even though we are using c++17
-    auto searcher = std::default_searcher(query.begin(), query.end(), pred);
-#else
-    auto searcher = std::boyer_moore_searcher(query.begin(), query.end(), hash, pred);
-#endif
-    auto it = std::search(
-        super_fast_search_index.begin() + begin_index,
-        super_fast_search_index.begin() + end_index,
-        searcher);
+    // same choice of predicate as get_pred
+    bool case_insensitive = (case_sensitive == SearchCaseSensitivity::CaseInsensitive) ||
+        ((case_sensitive == SearchCaseSensitivity::SmartCase) && QString::fromStdWString(query).isLower());
 
     int match_page = min_page;
 
-    for (; it != super_fast_search_index.end(); it = std::search(it + 1, super_fast_search_index.end(), searcher)) {
-        int start_index = it - super_fast_search_index.begin();
-        //std::deque<fz_rect> match_rects;
-        //std::vector<fz_rect> compressed_match_rects;
+    // matches starting at or after end_index are on pages after max_page, so we don't search for them
+    find_all_occurrences(super_fast_search_index, begin_index, end_index, query, case_insensitive, [&](size_t pos) {
+        int start_index = static_cast<int>(pos);
 
         while ((match_page < page_begin_indices.size() - 1) && page_begin_indices[match_page + 1] <= start_index) match_page++;
 
@@ -3993,7 +4298,7 @@ std::vector<SearchResult> search_text_with_index(const std::wstring& super_fast_
                 output.push_back(res);
             }
         }
-    }
+        });
 
     output.insert(output.end(), before_results.begin(), before_results.end());
     return output;
