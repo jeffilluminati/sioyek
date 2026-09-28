@@ -746,10 +746,10 @@ void PdfViewOpenGLWidget::render_scratchpad(QPainter* painter) {
 //}
 
 // A zoom change this soon after the previous one is part of a continuous zoom (e.g. pinching), during
-// which nothing is rendered until the zoom level has been still for ZOOM_SETTLE_MS: rendering (and
-// uploading) the pages at the zoom levels passed through makes the zooming stutter.
+// which nothing is rendered until the zoom level has been still for ZOOM_SETTLE_MS (or the pinch ends):
+// rendering (and uploading) the pages at the zoom levels passed through makes the zooming stutter.
 static const int CONTINUOUS_ZOOM_MS = 100;
-static const int ZOOM_SETTLE_MS = 120;
+static const int ZOOM_SETTLE_MS = 80;
 // time a frame may spend uploading rendered pages to textures, the rest are uploaded in the next frames
 static const float FRAME_UPLOAD_BUDGET_MS = 8;
 
@@ -769,6 +769,17 @@ void PdfViewOpenGLWidget::update_zoom_state() {
     else if (is_zooming_continuously && (ms_since_change >= ZOOM_SETTLE_MS)) {
         is_zooming_continuously = false;
     }
+    if (zoom_gesture_ended) {
+        // (even if the gesture's last zoom change is only drawn in this frame)
+        zoom_gesture_ended = false;
+        is_zooming_continuously = false;
+        zoom_settle_timer.stop();
+    }
+}
+
+void PdfViewOpenGLWidget::end_zoom_gesture() {
+    zoom_gesture_ended = true;
+    update();
 }
 
 void PdfViewOpenGLWidget::paintGL() {
