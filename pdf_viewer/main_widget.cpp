@@ -7018,7 +7018,8 @@ bool MainWidget::event(QEvent* event) {
                     is_pinching = true;
                     pdf_renderer->no_rerender = true;
                 }
-                if ((pinch->state() == Qt::GestureFinished) || (pinch->state() == Qt::GestureCanceled)) {
+                bool finished = (pinch->state() == Qt::GestureFinished) || (pinch->state() == Qt::GestureCanceled);
+                if (finished) {
                     is_pinching = false;
                     is_dragging = false;
                     pdf_renderer->no_rerender = false;
@@ -7026,8 +7027,10 @@ bool MainWidget::event(QEvent* event) {
                 }
                 float scale = pinch->scaleFactor();
 
-                if ((pinch->scaleFactor() >= 1 && pinch->lastScaleFactor() >= 1)
-                    || (pinch->scaleFactor() <= 1 && pinch->lastScaleFactor() <= 1)
+                // (the event that finishes the gesture, when the fingers are lifted, has the scale factor
+                // of the last one: applying it again made every pinch end with an extra zoom step)
+                if (!finished && ((pinch->scaleFactor() >= 1 && pinch->lastScaleFactor() >= 1)
+                    || (pinch->scaleFactor() <= 1 && pinch->lastScaleFactor() <= 1))
                     ){
 
                     if (opengl_widget->get_overview_page()){
@@ -7039,6 +7042,9 @@ bool MainWidget::event(QEvent* event) {
                         dv()->zoom_in_cursor(cursor_pos, scale);
                     }
                     validate_render();
+                }
+                if (finished) {
+                    opengl_widget->end_zoom_gesture();
                 }
                 return true;
             }

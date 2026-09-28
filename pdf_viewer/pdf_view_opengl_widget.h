@@ -134,6 +134,8 @@ private:
     // previous one. Nothing is rendered until it has been still for a moment (zoom_settle_timer then
     // draws a frame, which requests the pages at the final zoom level).
     bool is_zooming_continuously = false;
+    // the pinch gesture ended (the fingers were lifted), so the zoom level is final (see end_zoom_gesture)
+    bool zoom_gesture_ended = false;
     float last_frame_zoom_level = -1;
     std::chrono::steady_clock::time_point last_zoom_change_time;
     QTimer zoom_settle_timer;
@@ -273,6 +275,9 @@ public:
     void set_scissor_rect(NormalizedWindowRect rect);
     // updates is_zooming_continuously for the frame about to be drawn
     void update_zoom_state();
+    // Called when a zoom gesture (a pinch) ends: the pages are rendered at the final zoom level right
+    // away, rather than once it has been still for a moment.
+    void end_zoom_gesture();
     bool get_is_searching(float* prog);
     void search_text(const std::wstring& text, SearchCaseSensitivity case_sensitive = SearchCaseSensitivity::CaseInsensitive, bool regex = false, std::optional<std::pair<int, int>> range = {});
     void set_dark_mode(bool mode);

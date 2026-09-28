@@ -281,6 +281,22 @@ void bench_upload(fz_context* ctx, const std::vector<fz_pixmap*>& pixmaps, fz_pi
     int n = reps * (int)pixmaps.size();
     report("upload", "avg texture upload (main thread)", total_ms / n, "ms");
 
+    // The part of that the main thread is blocked for (the rest is done by the GPU and the driver, while
+    // the main thread goes on)
+    {
+        double call_ms = 0;
+        for (int r = 0; r < reps; r++) {
+            for (fz_pixmap* pixmap : pixmaps) {
+                auto t0 = Clock::now();
+                GLuint texture = create_texture_from_pixmap(pixmap);
+                call_ms += ms_since(t0);
+                glFinish();
+                glDeleteTextures(1, &texture);
+            }
+        }
+        report("upload", "main thread blocked per upload", call_ms / n, "ms");
+    }
+
     // Read the texture of the first page back as RGB and compare it with an RGB rendering of the same
     // page, to make sure the texture has the right colors whatever format the renderer produces.
     if (reference_rgb) {
@@ -734,7 +750,7 @@ void bench_session(fz_context* ctx, const std::wstring& path, int num_pages, con
     {
         auto t_zoom = Clock::now();
         const float new_zoom = zoom * 1.25f;
-        while (true) {
+        while (ms_since(t_zoom) < 5000) {
             bool done = true;
             for (int page : { steps - 1, steps }) {
                 int w, h;
@@ -755,7 +771,8 @@ void bench_session(fz_context* ctx, const std::wstring& path, int num_pages, con
     // pages: at zoom levels this high sioyek draws the visible part in tiles, which this doesn't do.)
     auto frames_until_sharp = [&](float z) {
         auto t0 = Clock::now();
-        while (true) {
+        // (pages too big for a texture never get sharp: they are drawn in tiles, which this doesn't do)
+        while (ms_since(t0) < 5000) {
             bool done = true;
             for (int page : { steps - 1, steps }) {
                 int w, h;
