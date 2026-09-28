@@ -953,8 +953,9 @@ Open the file in a new window but within the same sioyek instance.
 .B should_draw_unrendered_pages
 .I boolean
 
-If set, we display a checkerboard pattern for unrendered pages (by
-default we display nothing).
+If set (the default), pages or parts of pages that aren't rendered yet
+are drawn in the color of the document's paper (as rendered pages are,
+e.g. white for most documents). If 0, nothing is drawn for them.
 .HP
 .B check_for_updates_on_startup
 .I boolean

@@ -256,6 +256,56 @@ fz_pixmap* render_request_pixmap(fz_context* mupdf_context, fz_document* doc, co
     return rendered_pixmap;
 }
 
+// Estimates the color of the page's paper from a render of the page (or of a slice or tile of it): the
+// median of the pixels along the edges of the page, a little inside them (scans often have dark edges).
+// Returns false if the pixmap has none of the page's edges.
+static bool estimate_paper_color(fz_pixmap* pixmap, const RenderRequest& req, uint32_t* color) {
+    int w = pixmap->w;
+    int h = pixmap->h;
+    int n = pixmap->n;
+    if ((w <= 0) || (h <= 0) || (n < 3)) return false;
+
+    int nh = 1, nv = 1, h_index = 0, v_index = 0;
+    if (req.slice_index >= 0) {
+        nh = std::max(1, req.num_h_slices);
+        nv = std::max(1, req.num_v_slices);
+        h_index = req.slice_index % nh;
+        v_index = req.slice_index / nh;
+    }
+    // 2% of the page's width and height in
+    int inset_x = std::max(1, w * nh / 50);
+    int inset_y = std::max(1, h * nv / 50);
+
+    std::vector<unsigned char> channels[3];
+    auto sample = [&](int x, int y) {
+        const unsigned char* pixel = pixmap->samples + static_cast<size_t>(y) * pixmap->stride + static_cast<size_t>(x) * n;
+#ifdef SIOYEK_BGRA_TEXTURES
+        channels[0].push_back(pixel[2]);
+        channels[1].push_back(pixel[1]);
+        channels[2].push_back(pixel[0]);
+#else
+        channels[0].push_back(pixel[0]);
+        channels[1].push_back(pixel[1]);
+        channels[2].push_back(pixel[2]);
+#endif
+    };
+    int step_x = std::max(1, w / 256);
+    int step_y = std::max(1, h / 256);
+    if ((inset_x < w / 2) && (h_index == 0)) for (int y = 0; y < h; y += step_y) sample(inset_x, y);
+    if ((inset_x < w / 2) && (h_index == nh - 1)) for (int y = 0; y < h; y += step_y) sample(w - 1 - inset_x, y);
+    if ((inset_y < h / 2) && (v_index == 0)) for (int x = 0; x < w; x += step_x) sample(x, inset_y);
+    if ((inset_y < h / 2) && (v_index == nv - 1)) for (int x = 0; x < w; x += step_x) sample(x, h - 1 - inset_y);
+    if (channels[0].empty()) return false;
+
+    uint32_t result = 0;
+    for (auto& channel : channels) {
+        std::nth_element(channel.begin(), channel.begin() + channel.size() / 2, channel.end());
+        result = (result << 8) | channel[channel.size() / 2];
+    }
+    *color = result;
+    return true;
+}
+
 GLuint create_texture_from_pixmap(fz_pixmap* pixmap) {
     GLuint result = 0;
     glGenTextures(1, &result);
@@ -658,6 +708,21 @@ GLuint PdfRenderer::try_closest_rendered_page(std::wstring doc_path, int page, b
     return best_texture;
 }
 
+uint32_t PdfRenderer::get_paper_color(const std::wstring& path, int page) {
+    std::lock_guard<std::mutex> lock(cached_response_mutex);
+    auto document_colors = paper_colors.find(path);
+    if ((document_colors == paper_colors.end()) || document_colors->second.empty()) {
+        return 0xFFFFFF;
+    }
+    // the page's own, or that of the closest page before or after it
+    const std::map<int, uint32_t>& colors = document_colors->second;
+    auto after = colors.lower_bound(page);
+    if (after == colors.end()) return std::prev(after)->second;
+    if ((after->first == page) || (after == colors.begin())) return after->second;
+    auto before = std::prev(after);
+    return ((page - before->first) <= (after->first - page)) ? before->second : after->second;
+}
+
 void PdfRenderer::delete_old_pages(bool force_all, bool invalidate_all) {
     /*
     Deletes old cached pages. This function should only be called from the main thread.
@@ -691,6 +756,7 @@ void PdfRenderer::delete_old_pages(bool force_all, bool invalidate_all) {
     if (force_all || invalidate_all) {
         // the document may have changed (or is being closed)
         drop_display_lists();
+        paper_colors.clear();
     }
     else {
         // We never delete the most recently used responses that add up to num_cached_pages pages. A
@@ -1024,8 +1090,13 @@ void PdfRenderer::run(int thread_index) {
                 release_band_helpers(helpers);
                 helpers = -1;
                 rendering_workers--;
+                uint32_t paper_color = 0;
+                bool has_paper_color = estimate_paper_color(rendered_pixmap, req, &paper_color);
 
                 cached_response_mutex.lock();
+                if (has_paper_color) {
+                    paper_colors[req.path][req.page] = paper_color;
+                }
                 int index = get_pending_response_index_with_thread_index(req, thread_index);
                 if (index >= 0) {
                     cached_responses[index].last_access_time = QDateTime::currentMSecsSinceEpoch();

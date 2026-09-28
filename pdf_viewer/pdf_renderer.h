@@ -150,6 +150,10 @@ class PdfRenderer : public QObject {
     fz_display_list* get_page_display_list(fz_context* ctx, fz_document* doc, const RenderRequest& req, bool make_if_missing);
     void drop_display_lists(const std::wstring* path = nullptr);
 
+    // the paper color (0xRRGGBB) of the pages rendered so far, by document and page (see get_paper_color),
+    // guarded by cached_response_mutex
+    std::map<std::wstring, std::map<int, uint32_t>> paper_colors;
+
     // uploads to textures in the frame being drawn (see begin_frame)
     float frame_upload_budget_ms = 0;
     float frame_upload_ms = 0;
@@ -201,6 +205,9 @@ public:
     // The rendered page (or slice) with the zoom level closest to the given one, without requesting
     // anything to be rendered. 0 if there is none.
     GLuint find_closest_rendered_page(std::wstring path, int page, bool should_render_annotations, int index, int num_h_slices, int num_v_slices, float zoom_level, float display_scale, int* page_width, int* page_height);
+    // The color (0xRRGGBB) of the page's background, as rendered, for drawing the page while it isn't. If
+    // the page hasn't been rendered, that of the closest page of the document that has, or white.
+    uint32_t get_paper_color(const std::wstring& path, int page);
     void delete_old_pages(bool force_all = false, bool invalidate_all = false);
     void add_password(std::wstring path, std::string password);
     void debug();

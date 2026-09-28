@@ -1114,6 +1114,91 @@ void PdfViewOpenGLWidget::draw_closest_slices(int page_number, float zoom_level,
     }
 }
 
+// Limits drawing to `rect` (until GL_SCISSOR_TEST is disabled). Slices next to each other get scissor
+// rectangles next to each other, rather than overlapping by a pixel.
+void PdfViewOpenGLWidget::set_scissor_rect(NormalizedWindowRect rect) {
+    GLint viewport[4];
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    auto to_pixels = [](float normalized, int origin, int size) {
+        return origin + static_cast<int>(std::lround((normalized + 1) / 2 * size));
+    };
+    int x0 = to_pixels(std::min(rect.x0, rect.x1), viewport[0], viewport[2]);
+    int x1 = to_pixels(std::max(rect.x0, rect.x1), viewport[0], viewport[2]);
+    int y0 = to_pixels(std::min(rect.y0, rect.y1), viewport[1], viewport[3]);
+    int y1 = to_pixels(std::max(rect.y0, rect.y1), viewport[1], viewport[3]);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(x0, y0, std::max(0, x1 - x0), std::max(0, y1 - y0));
+}
+
+// Draws the texture of the whole page with the zoom level closest to zoom_level, if there is one, only
+// within clip_rect. Returns whether there was one.
+bool PdfViewOpenGLWidget::draw_closest_whole_page(int page_number, float zoom_level, ColorPalette forced_color_palette, NormalizedWindowRect clip_rect) {
+    Document* document = doc();
+    GLuint texture = pdf_renderer->find_closest_rendered_page(document->get_path(), page_number,
+        document->should_render_pdf_annotations(), -1, 1, 1, zoom_level, devicePixelRatioF(), nullptr, nullptr);
+    if (texture == 0) return false;
+
+    PagelessDocumentRect page_rect({ 0, 0, document->get_page_width(page_number), document->get_page_height(page_number) });
+    float vertices[8];
+    rect_to_quad(DocumentRect(page_rect, page_number).to_window_normalized(document_view), vertices);
+
+    set_scissor_rect(clip_rect);
+    bind_program(forced_color_palette);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glBindBuffer(GL_ARRAY_BUFFER, shared_gl_objects.uv_buffer_object);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(g_quad_uvs), rotation_uvs[0], GL_DYNAMIC_DRAW);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glBindBuffer(GL_ARRAY_BUFFER, shared_gl_objects.vertex_buffer_object);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_DYNAMIC_DRAW);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisable(GL_SCISSOR_TEST);
+    return true;
+}
+
+// After zooming out of a page that was drawn in tiles, until the page is rendered at the new zoom level,
+// the part of it that was in view is drawn from the tiles it was last drawn sharp with (only within
+// clip_rect). Unless any_scale, only while those are at most 4 times too big (shrunk more than that, the
+// page rendered at another zoom level looks better).
+void PdfViewOpenGLWidget::draw_zoomed_out_tiles(int page_number, float zoom_level, float device_pixel_ratio, ColorPalette forced_color_palette, NormalizedWindowRect clip_rect, bool any_scale) {
+    auto last_sharp = last_sharp_tile_zoom.find({ doc()->get_path(), page_number });
+    if (last_sharp == last_sharp_tile_zoom.end()) return;
+    float tile_zoom_level = last_sharp->second;
+    if (tile_zoom_level <= zoom_level) return;
+    if (!any_scale && (tile_zoom_level > 4 * zoom_level)) return;
+
+    set_scissor_rect(clip_rect);
+    draw_page_tiles(page_number, tile_zoom_level, zoom_level, device_pixel_ratio, forced_color_palette, false);
+    glDisable(GL_SCISSOR_TEST);
+}
+
+// A 1x1 texture of the color, for drawing a page that isn't rendered in the color of its paper, with the
+// same program (so in the same color palette) as rendered pages.
+GLuint PdfViewOpenGLWidget::get_paper_texture(uint32_t color) {
+    // the OpenGL contexts of all windows are shared, so these are too
+    static std::map<uint32_t, GLuint> textures;
+    auto it = textures.find(color);
+    if (it != textures.end()) return it->second;
+    if (textures.size() >= 64) {
+        for (auto [_, texture] : textures) {
+            glDeleteTextures(1, &texture);
+        }
+        textures.clear();
+    }
+
+    unsigned char rgb[3] = { static_cast<unsigned char>(color >> 16), static_cast<unsigned char>(color >> 8), static_cast<unsigned char>(color) };
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 1, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    textures[color] = texture;
+    return texture;
+}
+
 void PdfViewOpenGLWidget::render_page_tiles(int page_number, float zoom_level, float device_pixel_ratio, ColorPalette forced_color_palette, bool request_renders) {
     // Under the tiles of this zoom level, while they are being rendered (or while zooming, when nothing is
     // rendered), the tiles of the last zoom level whose visible tiles were all rendered are drawn stretched.
@@ -1321,6 +1406,8 @@ void PdfViewOpenGLWidget::render_page(int page_number, bool in_overview, ColorPa
         }
 
         GLuint texture = 0;
+        // whether texture is the page (or slice) rendered at zoom_level, rather than at another zoom level
+        bool exact = false;
         if (use_tiles) {
             // Under the tiles, the page is drawn from whichever texture of the whole page there is (usually
             // the one from before zooming in). Only if there is none, one is rendered.
@@ -1337,7 +1424,8 @@ void PdfViewOpenGLWidget::render_page(int page_number, bool in_overview, ColorPa
                 use_tiles ? base_zoom_level : zoom_level,
                 devicePixelRatioF(),
                 &rendered_width,
-                &rendered_height);
+                &rendered_height,
+                &exact);
         }
         else if ((texture == 0) && !use_tiles) {
             texture = pdf_renderer->find_closest_rendered_page(doc(in_overview)->get_path(),
@@ -1480,46 +1568,49 @@ void PdfViewOpenGLWidget::render_page(int page_number, bool in_overview, ColorPa
 
         rect_to_quad(window_rect, page_vertices);
 
+        // A page (or slice) that isn't rendered at any zoom level is drawn in the color of its paper (with
+        // should_draw_unrendered_pages), and over that, whatever there is of it drawn in another way: e.g.
+        // after zooming out of a page drawn in tiles, the texture of the whole page they were drawn over,
+        // and the tiles. So what was in view stays in view while the page is rendered at the new zoom level.
+        bool has_texture = texture != 0;
+        if (!has_texture && SHOULD_DRAW_UNRENDERED_PAGES) {
+            texture = get_paper_texture(pdf_renderer->get_paper_color(doc(in_overview)->get_path(), page_number));
+        }
+
         if (texture != 0) {
             bind_program(forced_color_palette);
             glBindTexture(GL_TEXTURE_2D, texture);
+
+            glEnableVertexAttribArray(0);
+            glEnableVertexAttribArray(1);
+
+            glBindBuffer(GL_ARRAY_BUFFER, shared_gl_objects.uv_buffer_object);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(g_quad_uvs), rotation_uvs[rotation_index], GL_DYNAMIC_DRAW);
+
+            glBindBuffer(GL_ARRAY_BUFFER, shared_gl_objects.vertex_buffer_object);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(page_vertices), page_vertices, GL_DYNAMIC_DRAW);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         }
-        else {
-            if (!SHOULD_DRAW_UNRENDERED_PAGES) {
-                if (use_tiles) {
-                    draw_closest_slices(page_number, zoom_level, forced_color_palette);
-                    render_page_tiles(page_number, zoom_level, device_pixel_ratio, forced_color_palette, request_renders);
-                }
-                continue;
-            }
-            float white[3] = {1, 1, 1};
-            std::array<float, 3> bgcolor = cc3(white);
-            glUseProgram(shared_gl_objects.highlight_program);
-            glUniform3fv(shared_gl_objects.highlight_color_uniform_location, 1, &bgcolor[0]);
-        }
-
-        glEnableVertexAttribArray(0);
-        glEnableVertexAttribArray(1);
-
-        glBindBuffer(GL_ARRAY_BUFFER, shared_gl_objects.uv_buffer_object);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(g_quad_uvs), rotation_uvs[rotation_index], GL_DYNAMIC_DRAW);
-
-        glBindBuffer(GL_ARRAY_BUFFER, shared_gl_objects.vertex_buffer_object);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(page_vertices), page_vertices, GL_DYNAMIC_DRAW);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
         if (use_tiles) {
-            if (texture == 0) {
+            if (!has_texture) {
                 draw_closest_slices(page_number, zoom_level, forced_color_palette);
             }
             render_page_tiles(page_number, zoom_level, device_pixel_ratio, forced_color_palette, request_renders);
         }
-        
+        else if (!exact && !in_overview && (rotation_index == 0)) {
+            bool drew_page = has_texture;
+            if (!has_texture && is_sliced) {
+                drew_page = draw_closest_whole_page(page_number, zoom_level, forced_color_palette, window_rect);
+            }
+            draw_zoomed_out_tiles(page_number, zoom_level, device_pixel_ratio, forced_color_palette, window_rect, !drew_page);
+        }
+
         if (document_view->is_two_page_mode() && (stencils_allowed)) {
             disable_stencil();
         }
 
-        if ((get_current_color_mode() != Normal) && (PRESERVE_IMAGE_COLORS) && (forced_color_palette == ColorPalette::None) && (stencils_allowed)) {
+        if (has_texture && (get_current_color_mode() != Normal) && (PRESERVE_IMAGE_COLORS) && (forced_color_palette == ColorPalette::None) && (stencils_allowed)) {
             // render images in forced palette mode
             fz_stext_page * stext_page = doc(in_overview)->get_stext_with_page_number(page_number);
             std::vector<PagelessDocumentRect> image_rects;

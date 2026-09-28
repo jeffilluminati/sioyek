@@ -267,6 +267,10 @@ public:
     void render_page_tiles(int page_number, float zoom_level, float device_pixel_ratio, ColorPalette forced_palette, bool request_renders);
     bool draw_page_tiles(int page_number, float tile_zoom_level, float zoom_level, float device_pixel_ratio, ColorPalette forced_palette, bool request_renders);
     void draw_closest_slices(int page_number, float zoom_level, ColorPalette forced_palette);
+    bool draw_closest_whole_page(int page_number, float zoom_level, ColorPalette forced_palette, NormalizedWindowRect clip_rect);
+    void draw_zoomed_out_tiles(int page_number, float zoom_level, float device_pixel_ratio, ColorPalette forced_palette, NormalizedWindowRect clip_rect, bool any_scale);
+    GLuint get_paper_texture(uint32_t color);
+    void set_scissor_rect(NormalizedWindowRect rect);
     // updates is_zooming_continuously for the frame about to be drawn
     void update_zoom_state();
     bool get_is_searching(float* prog);
