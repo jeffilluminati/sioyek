@@ -119,6 +119,29 @@ https://user-images.githubusercontent.com/6392321/125337160-e4832700-e363-11eb-8
 
 You can customize all key bindings and some UI elements by editing `keys_user.config` and `prefs_user.config`. The default configurations are in `keys.config` and `prefs.config`.
 
+Multi-page rows are controlled by `pages_per_row` (default `2`, range `1`–`100`).
+`toggle_two_page_mode` switches between single-page viewing and the configured number
+of columns. For example, add this to `prefs_user.config` to view three pages per row:
+
+```
+pages_per_row 3
+first_page_column 1
+```
+
+`first_page_column` is 1-based; use `3` to place the cover in the rightmost column
+of a three-column layout. The default `0` follows `recto_verso_adjustment`, preserving
+existing two-page bindings. Explicit values are clamped to the number of columns.
+These settings can also be changed live using `setconfig_pages_per_row` and
+`setconfig_first_page_column` in the command selector, followed by the desired value.
+For a key binding, use a command such as `setconfig_pages_per_row(3) <f3>`.
+Page navigation moves one row at a time, and presentation mode shows the whole row.
+
+The page-layout integration tests run against the qmake build's application objects:
+
+```
+make -f Makefile -f bench/layout_test.mk -j8 check-layout
+```
+
 
 
 ## Build Instructions

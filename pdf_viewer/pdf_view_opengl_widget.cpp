@@ -23,7 +23,6 @@
 #define GL_PRIMITIVE_RESTART_FIXED_INDEX  0x8D69
 #endif
 
-extern bool RECTO_VERSO_ADJUSTMENT;
 extern bool DEBUG_DISPLAY_FREEHAND_POINTS;
 extern bool DEBUG_SMOOTH_FREEHAND_DRAWINGS;
 extern Path shader_path;
@@ -1487,11 +1486,12 @@ void PdfViewOpenGLWidget::render_page(int page_number, bool in_overview, ColorPa
         WindowRect full_page_irect = fz_round_rect(fz_transform_rect(full_page_rect,
             fz_scale(zoom_level, zoom_level)));
         PagelessDocumentRect page_content = full_page_rect;
-        if (document_view->get_page_space_x() < 0) {
-            if (page_number % 2 == 1) {
+        if (!in_overview && document_view->is_two_page_mode() && document_view->get_page_space_x() < 0) {
+            int column = document_view->get_page_column(page_number);
+            if (column > 0) {
                 page_content.x0 -= document_view->get_page_space_x();
             }
-            else {
+            if (column + 1 < document_view->get_pages_per_row()) {
                 page_content.x1 += document_view->get_page_space_x();
             }
         }
@@ -1834,9 +1834,10 @@ void PdfViewOpenGLWidget::my_render(QPainter* painter) {
         }
         render_page(presentation_page_number);
         if (document_view->is_two_page_mode()) {
-            int other_page = presentation_page_number + ((presentation_page_number + static_cast<int>(RECTO_VERSO_ADJUSTMENT)) % 2 ? -1 : 1);
-            if (other_page >= 0 && other_page < doc()->num_pages())
-                render_page(other_page);
+            auto [begin, end] = document_view->get_page_row_range(presentation_page_number);
+            for (int page = begin; page < end; ++page) {
+                if (page != presentation_page_number) render_page(page);
+            }
         }
     }
     else {

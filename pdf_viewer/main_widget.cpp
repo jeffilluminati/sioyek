@@ -8152,8 +8152,11 @@ void MainWidget::on_configs_changed(std::vector<std::string>* config_names) {
         if (confname == "gamma") {
             should_invalidate_render = true;
         }
-        if (confname == "recto_verso_adjustment") {
-            dv()->fill_cached_virtual_rects(true);
+        if (confname == "recto_verso_adjustment" || confname == "pages_per_row" || confname == "first_page_column") {
+            main_document_view->refresh_page_layout();
+            if (NUM_CACHED_PAGES < 6) {
+                pdf_renderer->set_num_cached_pages(NUM_CACHED_PAGES * main_document_view->get_pages_per_row());
+            }
         }
         if (confname == "highlight_links") {
             opengl_widget->set_highlight_links(SHOULD_HIGHLIGHT_LINKS, false);
@@ -11444,7 +11447,7 @@ void MainWidget::handle_toggle_two_page_mode() {
     main_document_view->toggle_two_page();
     if (NUM_CACHED_PAGES < 6) {
         if (main_document_view->is_two_page_mode()) {
-            pdf_renderer->set_num_cached_pages(NUM_CACHED_PAGES * 2);
+            pdf_renderer->set_num_cached_pages(NUM_CACHED_PAGES * main_document_view->get_pages_per_row());
         }
         else {
             pdf_renderer->set_num_cached_pages(NUM_CACHED_PAGES);
