@@ -3249,6 +3249,24 @@ public:
     }
 };
 
+class SetPagesPerRowCommand : public TextCommand {
+public:
+    static inline const std::string cname = "set_pages_per_row";
+    static inline const std::string hname = "Select the number of pages per row";
+    SetPagesPerRowCommand(MainWidget* w) : TextCommand(cname, w) {};
+
+    std::string text_requirement_name() override { return "Pages per row (1-100)"; }
+
+    void perform() override {
+        if (!text.has_value()) return;
+        bool valid = false;
+        int columns = QString::fromStdWString(text.value()).toInt(&valid);
+        if (valid && columns >= 1 && columns <= 100) {
+            widget->handle_set_pages_per_row(columns);
+        }
+    }
+};
+
 class FitEpubToWindowCommand : public Command {
 public:
     static inline const std::string cname = "fit_epub_to_window";
@@ -7297,6 +7315,7 @@ CommandManager::CommandManager(ConfigManager* config_manager) {
     register_command<RegexSearchCommand>();
     register_command<ChapterSearchCommand>();
     register_command<ToggleTwoPageModeCommand>();
+    register_command<SetPagesPerRowCommand>();
     register_command<FitEpubToWindowCommand>();
     register_command<MoveDownCommand>();
     register_command<MoveUpCommand>();

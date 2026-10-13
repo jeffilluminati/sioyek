@@ -135,6 +135,10 @@ These settings can also be changed live using `setconfig_pages_per_row` and
 `setconfig_first_page_column` in the command selector, followed by the desired value.
 For a key binding, use a command such as `setconfig_pages_per_row(3) <f3>`.
 Page navigation moves one row at a time, and presentation mode shows the whole row.
+To select a layout directly, bind `set_pages_per_row(1) <C-1>` for single-page
+view and `set_pages_per_row(3) <C-3>` for three columns. This command also activates
+multi-page viewing as needed; repeating the same shortcut keeps the selected layout.
+Selecting one column preserves the last multi-page count for the existing toggle.
 
 The page-layout integration tests run against the qmake build's application objects:
 

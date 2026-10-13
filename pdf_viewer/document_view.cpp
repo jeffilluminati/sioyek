@@ -2301,6 +2301,19 @@ int DocumentView::get_pages_per_row() {
     return two_page_mode ? std::clamp(PAGES_PER_ROW, 1, 100) : 1;
 }
 
+void DocumentView::set_pages_per_row(int columns) {
+    columns = std::clamp(columns, 1, 100);
+    if (columns == 1) {
+        // Keep the last multi-page column count so the existing toggle restores it.
+        if (two_page_mode) toggle_two_page();
+        else fit_to_page_width();
+        return;
+    }
+    PAGES_PER_ROW = columns;
+    if (!two_page_mode) toggle_two_page();
+    else refresh_page_layout();
+}
+
 int DocumentView::get_page_column(int page) {
     int columns = get_pages_per_row();
     int first_column = FIRST_PAGE_COLUMN <= 0 ? static_cast<int>(RECTO_VERSO_ADJUSTMENT)
