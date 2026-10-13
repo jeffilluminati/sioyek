@@ -119,6 +119,11 @@ https://user-images.githubusercontent.com/6392321/125337160-e4832700-e363-11eb-8
 
 You can customize all key bindings and some UI elements by editing `keys_user.config` and `prefs_user.config`. The default configurations are in `keys.config` and `prefs.config`.
 
+The optional [preferred configuration](configs/preferred/README.md) shares the
+Gruvbox dark theme, Zathura/Vim-style bindings, recent-file shortcuts, and
+`Ctrl+1`–`Ctrl+9` page layouts used with this fork. Its README includes installation
+instructions and the macOS print helper setup.
+
 Multi-page rows are controlled by `pages_per_row` (default `2`, range `1`–`100`).
 `toggle_two_page_mode` switches between single-page viewing and the configured number
 of columns. For example, add this to `prefs_user.config` to view three pages per row:
