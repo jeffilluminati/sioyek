@@ -9976,6 +9976,7 @@ QJsonObject MainWidget::get_json_state() {
         result["y_offset_in_page"] = docpso.y;
 
         result["zoom_level"] = main_document_view->get_zoom_level();
+        result["pages_per_row"] = main_document_view->get_pages_per_row();
 
         result["selected_text"] = QString::fromStdWString(get_selected_text());
         result["window_id"] = window_id;
@@ -11452,6 +11453,13 @@ void MainWidget::handle_toggle_two_page_mode() {
         else {
             pdf_renderer->set_num_cached_pages(NUM_CACHED_PAGES);
         }
+    }
+}
+
+void MainWidget::handle_set_pages_per_row(int columns) {
+    main_document_view->set_pages_per_row(columns);
+    if (NUM_CACHED_PAGES < 6) {
+        pdf_renderer->set_num_cached_pages(NUM_CACHED_PAGES * main_document_view->get_pages_per_row());
     }
 }
 

@@ -201,6 +201,14 @@ static void test_uniform(LayoutView& view) {
     check(!view.is_two_page_mode() && view.get_pages_per_row() == 1, "toggle returns to single-page mode");
     view.toggle_two_page();
     check(view.is_two_page_mode() && view.get_pages_per_row() == 3, "toggle restores configured column count");
+
+    for (int columns : {1, 1, 3, 3, 2, 9, 1, 4, 4, 1}) {
+        view.set_pages_per_row(columns);
+        check(view.get_pages_per_row() == columns, "layout selector directly selects the requested column count");
+        check(view.is_two_page_mode() == (columns > 1), "layout selector enables or disables multi-page mode");
+    }
+    view.toggle_two_page();
+    check(view.get_pages_per_row() == 4, "single-page selection preserves the last multi-page count for the toggle");
 }
 
 static void test_mixed(LayoutView& view) {
