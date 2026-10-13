@@ -239,7 +239,13 @@ public:
     WindowPos virtual_to_window_pos(const VirtualPos& virtual_pos);
     NormalizedWindowRect virtual_to_normalized_window_rect(const VirtualRect& virtual_rect);
     void toggle_two_page();
+    // Historical name: this is the configurable multi-page mode.
     bool is_two_page_mode();
+    int get_pages_per_row();
+    int get_page_column(int page);
+    std::pair<int, int> get_page_row_range(int page); // [begin, end)
+    VirtualRect get_page_row_bounds(int page, bool include_empty_columns = false);
+    void refresh_page_layout();
     void set_page_space_x(float space_x);
     void set_page_space_y(float space_y);
 

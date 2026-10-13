@@ -27,6 +27,8 @@ extern bool SAME_WIDTH;
 extern bool SCROLL_PAST_DOCUMENT_ENDS;
 extern bool HORIZONTAL_SCROLL_PAST_PAGE_ENDS;
 extern bool RECTO_VERSO_ADJUSTMENT;
+extern int PAGES_PER_ROW;
+extern int FIRST_PAGE_COLUMN;
 
 DocumentView::DocumentView(DatabaseManager* db_manager,
     DocumentManager* document_manager,
@@ -289,9 +291,9 @@ void DocumentView::set_offset_x(float new_offset_x) {
 
 void DocumentView::set_offset_y(float new_offset_y) {
     if (is_two_page_mode()) {
-        int num_pages = current_document->num_pages();
+        if (!current_document) return;
+        fill_cached_virtual_rects();
         float halfscreen_offset = !SCROLL_PAST_DOCUMENT_ENDS ? view_height / 2 / zoom_level : 0;
-        int actual_num_pages = (num_pages + 1) / 2;
         float max_y_offset = max_virtual_y - halfscreen_offset;
 
         AbsoluteDocumentPos current = get_offsets();
@@ -735,13 +737,27 @@ void DocumentView::get_visible_pages(int window_height, std::vector<int>& visibl
 }
 
 void DocumentView::move_pages(int num_pages) {
-    if (!current_document) return;
+    if (!current_document || current_document->num_pages() == 0) return;
     int current_page = get_center_page_number();
     if (current_page == -1) {
         current_page = 0;
     }
 
-    int padding = two_page_mode ? page_space_y : PAGE_PADDINGS;
+    if (two_page_mode) {
+        fill_cached_virtual_rects();
+        int columns = get_pages_per_row();
+        int first = current_page - get_page_column(current_page);
+        long long target = static_cast<long long>(first) + static_cast<long long>(num_pages) * columns;
+        int target_page = static_cast<int>(std::clamp(target, 0LL,
+            static_cast<long long>(current_document->num_pages() - 1)));
+        VirtualRect source_row = get_page_row_bounds(current_page);
+        VirtualRect target_row = get_page_row_bounds(target_page);
+        float within_row = std::clamp(offset.y - source_row.y0, 0.0f, target_row.height());
+        move_virtual(0, target_row.y0 + within_row - offset.y);
+        return;
+    }
+
+    int padding = PAGE_PADDINGS;
 
     move_virtual(0, num_pages * (current_document->get_page_height(current_page) + padding));
     // this is only so that we don't go out of bounds
@@ -873,6 +889,14 @@ void DocumentView::fit_to_page_height_and_width_smart() {
     int cp = get_center_page_number();
     if (cp == -1) return;
 
+    if (two_page_mode) {
+        fit_to_page_width(true);
+        float width_zoom = zoom_level;
+        fit_to_page_height(true);
+        set_zoom_level(std::min(width_zoom, zoom_level), true, false);
+        return;
+    }
+
     float top_ratio, bottom_ratio;
     int normal_page_height;
 
@@ -900,6 +924,25 @@ void DocumentView::fit_to_page_height(bool smart) {
     int cp = get_center_page_number();
     if (cp == -1) return;
 
+    if (two_page_mode) {
+        VirtualRect bounds = get_page_row_bounds(cp);
+        if (smart) {
+            auto [begin, end] = get_page_row_range(cp);
+            bounds.y0 = FLT_MAX;
+            bounds.y1 = -FLT_MAX;
+            for (int page = begin; page < end; ++page) {
+                float top, bottom;
+                int height;
+                current_document->get_page_size_smart(false, page, &top, &bottom, &height);
+                bounds.y0 = std::min(bounds.y0, cached_virtual_rects[page].y0 + top * height);
+                bounds.y1 = std::max(bounds.y1, cached_virtual_rects[page].y0 + bottom * height);
+            }
+        }
+        set_zoom_level(static_cast<float>(view_height - 20) / std::max(1.0f, bounds.height()), true, false);
+        offset.y = bounds.center().y;
+        return;
+    }
+
     float top_ratio, bottom_ratio;
     int normal_page_height;
     int page_height = current_document->get_page_size_smart(false, cp, &top_ratio, &bottom_ratio, &normal_page_height);
@@ -922,50 +965,49 @@ void DocumentView::fit_to_page_width(bool smart, bool ratio) {
     int cp = get_center_page_number();
     if (cp == -1) return;
 
-    //int page_width = current_document->get_page_width(cp);
+    if (two_page_mode) {
+        AbsoluteDocumentPos anchor = get_offsets();
+        auto [begin, end] = get_page_row_range(cp);
+        page_space_x = PAGE_SPACE_X;
+        if (smart) {
+            // A shared crop must not cut content from any interior edge in the row.
+            float margin = FLT_MAX;
+            for (int page = begin; page < end; ++page) {
+                float left, right;
+                int width;
+                current_document->get_page_size_smart(true, page, &left, &right, &width);
+                int column = get_page_column(page);
+                if (column > 0) margin = std::min(margin, left * width);
+                if (column + 1 < get_pages_per_row()) margin = std::min(margin, (1 - right) * width);
+            }
+            if (margin != FLT_MAX) page_space_x = -std::max(0.0f, margin);
+        }
+        fill_cached_virtual_rects(true);
+        VirtualRect bounds = get_page_row_bounds(cp, true);
+        if (smart) {
+            float left, right;
+            int width;
+            current_document->get_page_size_smart(true, begin, &left, &right, &width);
+            if (get_page_column(begin) == 0) bounds.x0 += left * width;
+            current_document->get_page_size_smart(true, end - 1, &left, &right, &width);
+            if (get_page_column(end - 1) == get_pages_per_row() - 1) bounds.x1 -= (1 - right) * width;
+        }
+        float available_width = view_width * ((!smart && ratio) ? FIT_TO_PAGE_WIDTH_RATIO : 1.0f);
+        set_zoom_level(available_width / std::max(1.0f, bounds.width()), !smart);
+        offset.y = absolute_to_virtual_pos(anchor).y;
+        offset.x = -bounds.center().x;
+        return;
+    }
+
     if (smart) {
+        float left_ratio, right_ratio;
+        int normal_page_width;
+        int page_width = current_document->get_page_size_smart(true, cp, &left_ratio, &right_ratio, &normal_page_width);
+        float right_leftover = 1.0f - right_ratio;
+        float imbalance = left_ratio - right_leftover;
 
-        if (two_page_mode) {
-            int num_pages = current_document->num_pages();
-            int other_page = cp;
-            if (cp % 2 == 0) {
-                if (cp + 1 < num_pages) {
-                    other_page = cp + 1;
-                }
-            }
-            else {
-                other_page = cp - 1;
-            }
-            float left_left_ratio, left_right_ratio;
-            int left_normal_page_width;
-            float left_page_width = current_document->get_page_size_smart(true, cp, &left_left_ratio, &left_right_ratio, &left_normal_page_width);
-
-            float right_left_ratio, right_right_ratio;
-            int right_normal_page_width;
-            float right_page_width = current_document->get_page_size_smart(true, other_page, &right_left_ratio, &right_right_ratio, &right_normal_page_width);
-
-            float right_leftover = 1.0f - right_right_ratio;
-            float imbalance = left_left_ratio - right_leftover;
-
-            left_page_width += static_cast<int>((1-left_right_ratio) * left_normal_page_width);
-            right_page_width += static_cast<int>(right_left_ratio * right_normal_page_width);
-            page_space_x = -(left_normal_page_width * (1 - left_right_ratio) + right_normal_page_width * right_left_ratio) / 2;
-            cached_virtual_rects.clear();
-
-            set_zoom_level(static_cast<float>(view_width) / (left_page_width + right_page_width + page_space_x * 2), false);
-            offset.x = -imbalance * (left_normal_page_width + right_normal_page_width + page_space_x * 2) / 4.0f;
-        }
-
-        else {
-            float left_ratio, right_ratio;
-            int normal_page_width;
-            int page_width = current_document->get_page_size_smart(true, cp, &left_ratio, &right_ratio, &normal_page_width);
-            float right_leftover = 1.0f - right_ratio;
-            float imbalance = left_ratio - right_leftover;
-
-            set_zoom_level(static_cast<float>(view_width) / page_width, false);
-            set_offset_x(-imbalance * normal_page_width / 2.0f);
-        }
+        set_zoom_level(static_cast<float>(view_width) / page_width, false);
+        set_offset_x(-imbalance * normal_page_width / 2.0f);
     }
     else {
         int page_width = current_document->get_page_width(cp);
@@ -978,15 +1020,7 @@ void DocumentView::fit_to_page_width(bool smart, bool ratio) {
             virtual_view_width = static_cast<int>(static_cast<float>(view_width) * FIT_TO_PAGE_WIDTH_RATIO);
         }
 
-        if (two_page_mode) {
-            page_space_x = PAGE_SPACE_X;
-            cached_virtual_rects.clear();
-            offset.x = 0;
-            page_width += page_width + page_space_x;
-        }
-        else {
-            set_offset_x(0);
-        }
+        set_offset_x(0);
 
         set_zoom_level(static_cast<float>(virtual_view_width) / page_width, true);
     }
@@ -998,11 +1032,7 @@ void DocumentView::fit_to_page_height_width_minimum(int statusbar_height) {
     if (cp == -1) return;
 
     if (two_page_mode) {
-        fill_cached_virtual_rects();
-        int other_page = cp + ((cp + static_cast<int>(RECTO_VERSO_ADJUSTMENT)) % 2 ? -1 : 1);
-        VirtualRect bounds = cached_virtual_rects[cp];
-        if (other_page >= 0 && other_page < current_document->num_pages())
-            bounds = bounds.union_rect(cached_virtual_rects[other_page]);
+        VirtualRect bounds = get_page_row_bounds(cp);
         set_zoom_level(std::min(view_width / bounds.width(), (view_height - statusbar_height) / bounds.height()), true);
         offset.x = -bounds.center().x;
         offset.y = bounds.center().y + statusbar_height / (2.0f * zoom_level);
@@ -2158,38 +2188,29 @@ void DocumentView::fill_cached_virtual_rects(bool force) {
         int num_pages = current_document->num_pages();
         if (num_pages == 0) return;
 
+        same_width_mode_first_page_width = {};
         if (two_page_mode) {
-
-            for (int i = 0; i < num_pages; i++) {
-                float page_width = current_document->get_page_width(i);
-                float page_height = current_document->get_page_height(i);
-                VirtualRect page_rect;
-                page_rect.x0 = -page_width / 2;
-                page_rect.x1 = page_width / 2;
-                page_rect.y0 = cum_offset;
-                page_rect.y1 = cum_offset + page_height;
-
-                float mult = 1.0f;
-                if ((i + (int)RECTO_VERSO_ADJUSTMENT) % 2 == 1) {
-                    cum_offset += page_height + page_space_y;
+            int columns = get_pages_per_row();
+            for (int begin = 0; begin < num_pages;) {
+                int end = get_page_row_range(begin).second;
+                int first_column = get_page_column(begin);
+                float placeholder_width = current_document->get_page_width(begin);
+                float gap = page_space_x >= 0 ? page_space_x : 2 * page_space_x;
+                float row_width = (columns - (end - begin)) * placeholder_width + (columns - 1) * gap;
+                float row_height = 0;
+                for (int page = begin; page < end; ++page) {
+                    row_width += current_document->get_page_width(page);
+                    row_height = std::max(row_height, current_document->get_page_height(page));
                 }
-                else {
-                    mult = -1.0f;
+                float x = -row_width / 2 + first_column * (placeholder_width + gap);
+                for (int page = begin; page < end; ++page) {
+                    float width = current_document->get_page_width(page);
+                    float height = current_document->get_page_height(page);
+                    cached_virtual_rects.push_back(VirtualRect(fz_rect{x, cum_offset, x + width, cum_offset + height}));
+                    x += width + gap;
                 }
-
-                if (page_space_x >= 0) {
-                    page_rect.x0 += mult * (page_width + page_space_x) / 2;
-                    page_rect.x1 += mult * (page_width + page_space_x) / 2;
-                }
-                else {
-                    page_rect.x0 += mult * (page_width / 2) + mult * page_space_x;
-                    page_rect.x1 += mult * (page_width / 2) + mult * page_space_x;
-
-                }
-
-
-                cached_virtual_rects.push_back(page_rect);
-
+                cum_offset += row_height + page_space_y;
+                begin = end;
             }
         }
         else {
@@ -2226,8 +2247,8 @@ void DocumentView::fill_cached_virtual_rects(bool force) {
     }
     if (!needs_refill) {
         min_virtual_x = FLT_MAX;
-        max_virtual_x = FLT_MIN;
-        max_virtual_y = FLT_MIN;
+        max_virtual_x = -FLT_MAX;
+        max_virtual_y = -FLT_MAX;
 
         for (auto r : cached_virtual_rects) {
             min_virtual_x = std::min(min_virtual_x, r.x0);
@@ -2276,6 +2297,46 @@ bool DocumentView::is_two_page_mode() {
     return two_page_mode;
 }
 
+int DocumentView::get_pages_per_row() {
+    return two_page_mode ? std::clamp(PAGES_PER_ROW, 1, 100) : 1;
+}
+
+int DocumentView::get_page_column(int page) {
+    int columns = get_pages_per_row();
+    int first_column = FIRST_PAGE_COLUMN <= 0 ? static_cast<int>(RECTO_VERSO_ADJUSTMENT)
+        : FIRST_PAGE_COLUMN - 1;
+    first_column = std::clamp(first_column, 0, columns - 1);
+    return (page % columns + first_column) % columns;
+}
+
+std::pair<int, int> DocumentView::get_page_row_range(int page) {
+    int begin = page - get_page_column(page);
+    return {std::max(0, begin), std::min(current_document->num_pages(), begin + get_pages_per_row())};
+}
+
+VirtualRect DocumentView::get_page_row_bounds(int page, bool include_empty_columns) {
+    fill_cached_virtual_rects();
+    auto [begin, end] = get_page_row_range(page);
+    VirtualRect bounds = cached_virtual_rects[begin];
+    for (int i = begin + 1; i < end; ++i) bounds = bounds.union_rect(cached_virtual_rects[i]);
+    if (include_empty_columns) {
+        float gap = page_space_x >= 0 ? page_space_x : 2 * page_space_x;
+        float step = current_document->get_page_width(begin) + gap;
+        bounds.x0 -= get_page_column(begin) * step;
+        bounds.x1 += (get_pages_per_row() - 1 - get_page_column(end - 1)) * step;
+    }
+    return bounds;
+}
+
+void DocumentView::refresh_page_layout() {
+    AbsoluteDocumentPos anchor = get_offsets();
+    fill_cached_virtual_rects(true);
+    if (current_document) {
+        set_offsets(anchor.x, anchor.y);
+        if (two_page_mode) fit_to_page_width();
+    }
+}
+
 void DocumentView::set_page_space_x(float space_x) {
     page_space_x = space_x;
 }
@@ -2289,7 +2350,7 @@ float DocumentView::get_page_space_x() {
 }
 
 float DocumentView::get_page_space_y() {
-    return page_space_x;
+    return page_space_y;
 }
 
 bool DocumentView::fast_coordinates() {
