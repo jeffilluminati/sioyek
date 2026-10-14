@@ -6,6 +6,7 @@ in vec2 uvs;
 uniform sampler2D pdf_texture;
 
 uniform float contrast;
+uniform float preserve_faithful;
 
 //http://gamedev.stackexchange.com/questions/59797/glsl-shader-change-hue-saturation-brightness
 vec3 rgb2hsv(vec3 c)
@@ -28,10 +29,12 @@ vec3 hsv2rgb(vec3 c)
 
 
 void main(){
-    vec3 tempcolor = texture(pdf_texture, uvs).rgb;
+    vec4 tex = texture(pdf_texture, uvs);
+    vec3 tempcolor = tex.rgb;
     vec3 inv = (0.5-tempcolor)*contrast+0.5; //Invert colors and shift colors from range 0.0 - 1.0 to -0.5 - 0.5, apply contrast and shift back to 0.0 - 1.0. This way contrast applies on both whites and blacks
     vec3 hsvcolor = rgb2hsv(inv); //transform to hsv
     float new_hue = mod(hsvcolor.r + 0.5, 1.0); // shift hue 180 degrees to compensate hue shift from inverting colors 
     vec3 newcolor = hsv2rgb(vec3(new_hue,hsvcolor.gb)); 
-    color = vec4(newcolor, 1.0);
+    float weight = mix(1.0, tex.a, preserve_faithful);
+    color = vec4(mix(tempcolor, newcolor, weight), 1.0);
 }

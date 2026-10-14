@@ -27,6 +27,7 @@ extern bool SAME_WIDTH;
 extern bool SCROLL_PAST_DOCUMENT_ENDS;
 extern bool HORIZONTAL_SCROLL_PAST_PAGE_ENDS;
 extern bool RECTO_VERSO_ADJUSTMENT;
+extern bool AUTO_CROP_PAGES;
 extern int PAGES_PER_ROW;
 extern int FIRST_PAGE_COLUMN;
 
@@ -564,6 +565,10 @@ void DocumentView::goto_left_smart() {
 }
 
 void DocumentView::goto_left() {
+    if (AUTO_CROP_PAGES) {
+        goto_left_smart();
+        return;
+    }
     float page_width = current_document->get_page_width(get_center_page_number());
     float view_left_offset = (page_width / 2 - view_width / zoom_level / 2);
     set_offset_x(view_left_offset);
@@ -580,6 +585,10 @@ void DocumentView::goto_right_smart() {
 }
 
 void DocumentView::goto_right() {
+    if (AUTO_CROP_PAGES) {
+        goto_right_smart();
+        return;
+    }
     float page_width = current_document->get_page_width(get_center_page_number());
     float view_left_offset = -(page_width / 2 - view_width / zoom_level / 2);
     set_offset_x(view_left_offset);
@@ -643,7 +652,7 @@ float DocumentView::zoom_in_cursor(WindowPos mouse_pos, float zoom_factor) {
     fvec2 diff = prev_mouse_abs_pos - prev_document_offset;
 
     float old_zoom_level = zoom_level;
-    float new_zoom_level = set_zoom_level(zoom_level * zoom_factor, false);
+    float new_zoom_level = set_zoom_level(zoom_level * zoom_factor, true);
     float actual_inc = new_zoom_level / old_zoom_level;
 
     fvec2 new_diff = diff / actual_inc;
@@ -921,6 +930,7 @@ void DocumentView::fit_to_page_height_and_width_smart() {
 }
 
 void DocumentView::fit_to_page_height(bool smart) {
+    if (AUTO_CROP_PAGES) smart = true;
     int cp = get_center_page_number();
     if (cp == -1) return;
 
@@ -961,6 +971,7 @@ void DocumentView::fit_to_page_height(bool smart) {
 
 void DocumentView::fit_to_page_width(bool smart, bool ratio) {
     if (!current_document) return;
+    if (AUTO_CROP_PAGES) smart = true;
 
     int cp = get_center_page_number();
     if (cp == -1) return;
@@ -988,9 +999,9 @@ void DocumentView::fit_to_page_width(bool smart, bool ratio) {
             float left, right;
             int width;
             current_document->get_page_size_smart(true, begin, &left, &right, &width);
-            if (get_page_column(begin) == 0) bounds.x0 += left * width;
+            bounds.x0 += left * width;
             current_document->get_page_size_smart(true, end - 1, &left, &right, &width);
-            if (get_page_column(end - 1) == get_pages_per_row() - 1) bounds.x1 -= (1 - right) * width;
+            bounds.x1 -= (1 - right) * width;
         }
         float available_width = view_width * ((!smart && ratio) ? FIT_TO_PAGE_WIDTH_RATIO : 1.0f);
         set_zoom_level(available_width / std::max(1.0f, bounds.width()), !smart);
@@ -1636,6 +1647,10 @@ void DocumentView::disable_auto_resize_mode() {
 }
 
 void DocumentView::readjust_to_screen() {
+    if (!fast_coordinates()) {
+        move_virtual(0, 0);
+        return;
+    }
     this->set_offsets(this->get_offset_x(), this->get_offset_y());
 }
 
@@ -2316,7 +2331,7 @@ void DocumentView::set_pages_per_row(int columns) {
 
 int DocumentView::get_page_column(int page) {
     int columns = get_pages_per_row();
-    int first_column = FIRST_PAGE_COLUMN <= 0 ? static_cast<int>(RECTO_VERSO_ADJUSTMENT)
+    int first_column = FIRST_PAGE_COLUMN <= 0 ? (RECTO_VERSO_ADJUSTMENT ? columns - 1 : 0)
         : FIRST_PAGE_COLUMN - 1;
     first_column = std::clamp(first_column, 0, columns - 1);
     return (page % columns + first_column) % columns;

@@ -82,6 +82,8 @@ struct OpenGLSharedResources {
     //GLint gamma_uniform_location = 0;
 
     GLint custom_color_transform_uniform_location = 0;
+    GLint custom_color_preserve_faithful_uniform_location = 0;
+    GLint dark_mode_preserve_faithful_uniform_location = 0;
 
     GLint separator_background_color_uniform_location = 0;
     GLint freehand_line_color_uniform_location = 0;

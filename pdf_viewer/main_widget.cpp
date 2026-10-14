@@ -102,6 +102,7 @@ extern "C" {
 #ifdef Q_OS_MACOS
 extern "C" void changeTitlebarColor(WId, double, double, double, double);
 extern "C" void hideWindowTitleBar(WId);
+extern "C" void configureMacosWindowTitleBar(WId, double, double, double, bool);
 #endif
 
 extern int next_window_id;
@@ -124,6 +125,8 @@ extern std::wstring PAPER_SEARCH_CONTRIB_PATH;
 extern bool FUZZY_SEARCHING;
 extern bool AUTO_RENAME_DOWNLOADED_PAPERS;
 extern bool SHOW_STATUSBAR_ONLY_WHEN_MOUSE_OVER;
+extern bool SHOW_SCROLLBAR_ONLY_WHEN_MOUSE_OVER;
+extern bool AUTO_CROP_PAGES;
 extern bool HIGHLIGHT_LINK_DESTINATION;
 
 extern float TEXT_SELECTION_MINIMUM_DISTANCE;
@@ -294,6 +297,8 @@ const int MENU_BAR_DELAY_MS = 300;
 #ifdef Q_OS_MACOS
 extern float MACOS_TITLEBAR_COLOR[3];
 extern bool MACOS_HIDE_TITLEBAR;
+extern float BACKGROUND_COLOR[3];
+extern float DARK_MODE_BACKGROUND_COLOR[3];
 #endif
 
 MainWidget* get_window_with_window_id(int window_id) {
@@ -487,6 +492,17 @@ void MainWidget::resizeEvent(QResizeEvent* resize_event) {
     main_window_width = size().width();
     main_window_height = size().height();
 
+    if (central_widget) {
+        central_widget->move(0, 0);
+        central_widget->resize(main_window_width, main_window_height);
+    }
+
+#ifdef Q_OS_MACOS
+    if (isVisible()) {
+        update_macos_titlebar();
+    }
+#endif
+
     if (scratchpad) {
         scratchpad->on_view_size_change(resize_event->size().width(), resize_event->size().height());
         invalidate_render();
@@ -508,6 +524,19 @@ void MainWidget::resizeEvent(QResizeEvent* resize_event) {
         status_label->resize(main_window_width, status_bar_height);
         if (should_show_status_label()) {
             status_label->show();
+        }
+    }
+
+    if (scroll_bar != nullptr) {
+        int sb_width = scroll_bar->sizeHint().width();
+        if (sb_width <= 0) sb_width = 14;
+        scroll_bar->move(main_window_width - sb_width, 0);
+        scroll_bar->resize(sb_width, main_window_height);
+        if (should_show_scrollbar()) {
+            scroll_bar->show();
+        }
+        else {
+            scroll_bar->hide();
         }
     }
 
@@ -628,6 +657,19 @@ void MainWidget::mouseMoveEvent(QMouseEvent* mouse_event) {
         else {
             if (status_label->isVisible()) {
                 status_label->hide();
+            }
+        }
+    }
+
+    if (SHOW_SCROLLBAR_ONLY_WHEN_MOUSE_OVER && scroll_bar != nullptr) {
+        if (should_show_scrollbar()) {
+            if (!scroll_bar->isVisible()) {
+                scroll_bar->show();
+            }
+        }
+        else {
+            if (scroll_bar->isVisible()) {
+                scroll_bar->hide();
             }
         }
     }
@@ -928,10 +970,18 @@ MainWidget::MainWidget(fz_context* mupdf_context,
     setAcceptDrops(true);
     setAttribute(Qt::WA_DeleteOnClose);
     setAttribute(Qt::WA_AcceptTouchEvents);
+#ifdef Q_OS_MACOS
+    setWindowFlag(Qt::ExpandedClientAreaHint, true);
+    setWindowFlag(Qt::NoTitleBarBackgroundHint, true);
+    setAttribute(Qt::WA_ContentsMarginsRespectsSafeArea, false);
+#endif
 
 
     central_widget = new QWidget(this);
     central_widget->setMouseTracking(true);
+#ifdef Q_OS_MACOS
+    central_widget->setAttribute(Qt::WA_ContentsMarginsRespectsSafeArea, false);
+#endif
 
     inverse_search_command = INVERSE_SEARCH_COMMAND;
     this->pdf_renderer = pdf_renderer;
@@ -949,6 +999,7 @@ MainWidget::MainWidget(fz_context* mupdf_context,
     status_label = new QWidget(this);
     status_label->setFont(label_font);
     status_label->setStyleSheet(get_status_stylesheet());
+    status_label->setAttribute(Qt::WA_TransparentForMouseEvents);
 
     status_label_left = new QLabel();
     status_label_left->setStyleSheet(get_status_stylesheet());
@@ -995,7 +1046,11 @@ MainWidget::MainWidget(fz_context* mupdf_context,
 
     text_command_line_edit_container_layout->addWidget(text_command_line_edit_label);
     text_command_line_edit_container_layout->addWidget(text_command_line_edit);
+#ifdef Q_OS_MACOS
+    text_command_line_edit_container_layout->setContentsMargins(MACOS_HIDE_TITLEBAR ? 10 : 78, 0, 10, 0);
+#else
     text_command_line_edit_container_layout->setContentsMargins(10, 0, 10, 0);
+#endif
 
     text_command_line_edit_container->setLayout(text_command_line_edit_container_layout);
     text_command_line_edit_container->hide();
@@ -1239,6 +1294,19 @@ MainWidget::MainWidget(fz_context* mupdf_context,
             selection_end_indicator->update_pos();
         }
 
+        if (SHOW_SCROLLBAR_ONLY_WHEN_MOUSE_OVER && scroll_bar != nullptr) {
+            if (should_show_scrollbar()) {
+                if (!scroll_bar->isVisible()) {
+                    scroll_bar->show();
+                }
+            }
+            else {
+                if (scroll_bar->isVisible()) {
+                    scroll_bar->hide();
+                }
+            }
+        }
+
         if (doc()) {
             if (doc()->get_should_reload_annotations()) {
                 doc()->reload_annotations_on_new_checksum();
@@ -1306,7 +1374,6 @@ MainWidget::MainWidget(fz_context* mupdf_context,
 
 
     hlayout->addWidget(opengl_widget);
-    hlayout->addWidget(scroll_bar);
 
     layout->setSpacing(0);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -1319,6 +1386,7 @@ MainWidget::MainWidget(fz_context* mupdf_context,
     central_widget->setLayout(layout);
     opengl_widget->stackUnder(status_label);
     setCentralWidget(central_widget);
+    scroll_bar->raise();
 #endif
 
     scroll_bar->setMinimum(0);
@@ -1360,14 +1428,11 @@ MainWidget::MainWidget(fz_context* mupdf_context,
         });
 
 #ifdef Q_OS_MACOS
-    // only apply titlebar menu if the user has specifically changed it in settings
-    if (MACOS_TITLEBAR_COLOR[0] >= 0){
-        changeTitlebarColor(winId(), MACOS_TITLEBAR_COLOR[0], MACOS_TITLEBAR_COLOR[1], MACOS_TITLEBAR_COLOR[2], 1.0f);
-    }
-
-    if (MACOS_HIDE_TITLEBAR) {
-        hideWindowTitleBar(winId());
-    }
+    QTimer::singleShot(0, this, [this]() {
+        if (isVisible()) {
+            update_macos_titlebar();
+        }
+        });
     // The menu bar is made once the window is up: making it first creates the native window, which
     // then isn't created along with everything else when the window is shown, and delays the first
     // page by ~50ms. (Only the native menu bar is affected, the key bindings don't depend on it.)
@@ -1375,6 +1440,9 @@ MainWidget::MainWidget(fz_context* mupdf_context,
         menu_bar = create_main_menu_bar();
         setMenuBar(menu_bar);
         menu_bar->stackUnder(text_command_line_edit_container);
+        if (isVisible()) {
+            update_macos_titlebar();
+        }
         });
 #endif
 
@@ -1823,11 +1891,16 @@ void MainWidget::validate_render() {
     if (!isVisible()) {
         return;
     }
-    if (last_smart_fit_page) {
+    if (last_smart_fit_page && main_document_view->get_document()) {
         int current_page = get_current_page_number();
-        if (current_page != last_smart_fit_page) {
-            main_document_view->fit_to_page_width(true);
-            last_smart_fit_page = current_page;
+        if (current_page >= 0) {
+            int target_page = main_document_view->is_two_page_mode()
+                ? main_document_view->get_page_row_range(current_page).first
+                : current_page;
+            if (target_page != last_smart_fit_page) {
+                main_document_view->fit_to_page_width(true);
+                last_smart_fit_page = target_page;
+            }
         }
     }
     if (main_document_view->is_presentation_mode()) {
@@ -1929,6 +2002,9 @@ void MainWidget::on_config_file_changed(ConfigManager* new_config) {
     status_label->move(0, main_window_height - status_bar_height);
     status_label->resize(size().width(), status_bar_height);
     update_command_hints_position();
+#ifdef Q_OS_MACOS
+    update_macos_titlebar();
+#endif
 
     //text_command_line_edit_container->setStyleSheet("background-color: black; color: white; border: none;");
 }
@@ -2161,6 +2237,14 @@ void MainWidget::open_document(const std::wstring& path, std::optional<float> of
 
     // reset smart fit when changing documents
     last_smart_fit_page = {};
+    if (AUTO_CROP_PAGES && main_document_view->get_is_auto_resize_mode() && main_document_view->get_document()) {
+        int current_page = get_current_page_number();
+        if (current_page >= 0) {
+            last_smart_fit_page = main_document_view->is_two_page_mode()
+                ? main_document_view->get_page_row_range(current_page).first
+                : current_page;
+        }
+    }
     opengl_widget->on_document_view_reset();
     show_password_prompt_if_required();
 
@@ -2226,6 +2310,14 @@ void MainWidget::open_document_at_location(const Path& path_,
 
     // reset smart fit when changing documents
     last_smart_fit_page = {};
+    if (AUTO_CROP_PAGES && main_document_view->get_is_auto_resize_mode() && main_document_view->get_document()) {
+        int current_page = get_current_page_number();
+        if (current_page >= 0) {
+            last_smart_fit_page = main_document_view->is_two_page_mode()
+                ? main_document_view->get_page_row_range(current_page).first
+                : current_page;
+        }
+    }
     opengl_widget->on_document_view_reset();
     show_password_prompt_if_required();
 }
@@ -4166,6 +4258,9 @@ void MainWidget::toggle_dark_mode() {
         helper_opengl_widget_->toggle_dark_mode();
         helper_opengl_widget_->update();
     }
+#ifdef Q_OS_MACOS
+    update_macos_titlebar();
+#endif
 }
 
 void MainWidget::toggle_custom_color_mode() {
@@ -4175,6 +4270,53 @@ void MainWidget::toggle_custom_color_mode() {
         helper_opengl_widget_->toggle_custom_color_mode();
         helper_opengl_widget_->update();
     }
+#ifdef Q_OS_MACOS
+    update_macos_titlebar();
+#endif
+}
+
+void MainWidget::update_macos_titlebar() {
+#ifdef Q_OS_MACOS
+    if (text_command_line_edit_container && text_command_line_edit_container->layout()) {
+        text_command_line_edit_container->layout()->setContentsMargins(MACOS_HIDE_TITLEBAR ? 10 : 78, 0, 10, 0);
+    }
+
+    double r = BACKGROUND_COLOR[0];
+    double g = BACKGROUND_COLOR[1];
+    double b = BACKGROUND_COLOR[2];
+
+    if (MACOS_TITLEBAR_COLOR[0] >= 0) {
+        r = MACOS_TITLEBAR_COLOR[0];
+        g = MACOS_TITLEBAR_COLOR[1];
+        b = MACOS_TITLEBAR_COLOR[2];
+    } else if (opengl_widget) {
+        auto color_mode = opengl_widget->get_current_color_mode();
+        if (color_mode == PdfViewOpenGLWidget::ColorPalette::Dark) {
+            r = DARK_MODE_BACKGROUND_COLOR[0];
+            g = DARK_MODE_BACKGROUND_COLOR[1];
+            b = DARK_MODE_BACKGROUND_COLOR[2];
+        } else if (color_mode == PdfViewOpenGLWidget::ColorPalette::Custom) {
+            r = CUSTOM_BACKGROUND_COLOR[0];
+            g = CUSTOM_BACKGROUND_COLOR[1];
+            b = CUSTOM_BACKGROUND_COLOR[2];
+        } else {
+            r = BACKGROUND_COLOR[0];
+            g = BACKGROUND_COLOR[1];
+            b = BACKGROUND_COLOR[2];
+        }
+    }
+
+    if (isVisible() || windowHandle() != nullptr) {
+        configureMacosWindowTitleBar(winId(), r, g, b, MACOS_HIDE_TITLEBAR);
+    }
+
+    if (helper_opengl_widget_) {
+        QWidget* helper_window = get_top_level_widget(helper_opengl_widget_);
+        if (helper_window && (helper_window->isVisible() || helper_window->windowHandle() != nullptr)) {
+            configureMacosWindowTitleBar(helper_window->winId(), r, g, b, MACOS_HIDE_TITLEBAR);
+        }
+    }
+#endif
 }
 
 
@@ -4334,7 +4476,7 @@ void MainWidget::move_vertical(float amount) {
 void MainWidget::zoom(WindowPos pos, float zoom_factor, bool zoom_in) {
     last_smart_fit_page = {};
     if (zoom_in) {
-        if (WHEEL_ZOOM_ON_CURSOR) {
+        if (WHEEL_ZOOM_ON_CURSOR && !dv()->is_two_page_mode()) {
             dv()->zoom_in_cursor(pos, zoom_factor);
         }
         else {
@@ -4342,7 +4484,7 @@ void MainWidget::zoom(WindowPos pos, float zoom_factor, bool zoom_in) {
         }
     }
     else {
-        if (WHEEL_ZOOM_ON_CURSOR) {
+        if (WHEEL_ZOOM_ON_CURSOR && !dv()->is_two_page_mode()) {
             dv()->zoom_out_cursor(pos, zoom_factor);
         }
         else {
@@ -4493,9 +4635,7 @@ void MainWidget::apply_window_params_for_two_window_mode() {
     QWidget* helper_window = get_top_level_widget(helper_opengl_widget());
 
 #ifdef Q_OS_MACOS
-    if (MACOS_HIDE_TITLEBAR) {
-        hideWindowTitleBar(helper_window->winId());
-    }
+    update_macos_titlebar();
 #endif
     //int main_window_width = QApplication::desktop()->screenGeometry(0).width();
     int main_window_width = get_current_monitor_width();
@@ -5139,7 +5279,11 @@ void MainWidget::toggle_statusbar() {
 }
 
 void MainWidget::toggle_titlebar() {
-
+#ifdef Q_OS_MACOS
+    MACOS_HIDE_TITLEBAR = !MACOS_HIDE_TITLEBAR;
+    update_macos_titlebar();
+    return;
+#endif
     Qt::WindowFlags flags = windowFlags();
     if (flags.testFlag(Qt::WindowTitleHint)) {
         flags |= Qt::CustomizeWindowHint;
@@ -5501,19 +5645,15 @@ void MainWidget::handle_keyboard_select(const std::wstring& text) {
 
 
 void MainWidget::toggle_scrollbar() {
-
-    // dirty hack!
-    // really the content of this closure should be in toggle_scrollbar method, however,
-    // for some unknown reason if we do that, new windows are created very small when 
-    // toggle_scrollbar is in startup_commands. Strangely the culprit seems to be this line:
-    // scroll_bar->show()
-    // todo: figure out why this is the case and fix it
+    should_show_scrollbar_ = !should_show_scrollbar_;
     QTimer::singleShot(100, [&]() {
-        if (scroll_bar->isVisible()) {
-            scroll_bar->hide();
-        }
-        else {
-            scroll_bar->show();
+        if (scroll_bar != nullptr) {
+            if (should_show_scrollbar()) {
+                scroll_bar->show();
+            }
+            else {
+                scroll_bar->hide();
+            }
         }
         main_window_width = opengl_widget->width();
         });
@@ -6539,6 +6679,9 @@ MainWidget* MainWidget::create_restored_window(MainWidget* sibling, const Window
     }
     
     new_w->show();
+#ifdef Q_OS_MACOS
+    new_w->update_macos_titlebar();
+#endif
     windows.push_back(new_w);
     return new_w;
 }
@@ -6578,6 +6721,9 @@ MainWidget* MainWidget::handle_new_window() {
     else if (color_mode == PdfViewOpenGLWidget::ColorPalette::Custom) {
         new_widget->opengl_widget->set_custom_color_mode(true);
     }
+#ifdef Q_OS_MACOS
+    new_widget->update_macos_titlebar();
+#endif
 
     windows.push_back(new_widget);
     return new_widget;
@@ -7047,9 +7193,15 @@ bool MainWidget::event(QEvent* event) {
                         opengl_widget->zoom_overview(scale);
                     }
                     else{
-                        QPoint cursor = mapFromGlobal(QCursor::pos());
-                        WindowPos cursor_pos = {cursor.x(), cursor.y()};
-                        dv()->zoom_in_cursor(cursor_pos, scale);
+                        last_smart_fit_page = {};
+                        if (dv()->is_two_page_mode()) {
+                            dv()->zoom_in(scale);
+                        }
+                        else {
+                            QPoint cursor = mapFromGlobal(QCursor::pos());
+                            WindowPos cursor_pos = {cursor.x(), cursor.y()};
+                            dv()->zoom_in_cursor(cursor_pos, scale);
+                        }
                     }
                     validate_render();
                 }
@@ -7441,6 +7593,9 @@ void MainWidget::set_dark_mode() {
             helper_opengl_widget_->set_dark_mode(true);
         }
     }
+#ifdef Q_OS_MACOS
+    update_macos_titlebar();
+#endif
 }
 
 void MainWidget::set_light_mode() {
@@ -7452,6 +7607,9 @@ void MainWidget::set_light_mode() {
             helper_opengl_widget_->set_dark_mode(false);
         }
     }
+#ifdef Q_OS_MACOS
+    update_macos_titlebar();
+#endif
 }
 
 void MainWidget::set_custom_color_mode() {
@@ -7463,6 +7621,9 @@ void MainWidget::set_custom_color_mode() {
             helper_opengl_widget_->set_custom_color_mode(true);
         }
     }
+#ifdef Q_OS_MACOS
+    update_macos_titlebar();
+#endif
 }
 
 
@@ -8048,6 +8209,22 @@ bool MainWidget::should_show_status_label(bool check_network) {
     }
 }
 
+bool MainWidget::should_show_scrollbar() {
+    if (TOUCH_MODE || scroll_bar == nullptr || !isVisible()) {
+        return false;
+    }
+    if (SHOW_SCROLLBAR_ONLY_WHEN_MOUSE_OVER) {
+        if (scroll_bar->isSliderDown()) {
+            return true;
+        }
+        QPoint mouse_cursor = mapFromGlobal(QCursor::pos());
+        int vicinity_width = std::max(scroll_bar->width(), 14) + 16;
+        QRect vicinity_rect(main_window_width - vicinity_width, 0, vicinity_width, main_window_height);
+        return vicinity_rect.contains(mouse_cursor);
+    }
+    return should_show_scrollbar_;
+}
+
 bool MainWidget::is_in_middle_left_rect(WindowPos pos) {
     NormalizedWindowPos nwp = main_document_view->window_to_normalized_window_pos(pos);
     if (screen()->orientation() == Qt::PortraitOrientation) {
@@ -8132,8 +8309,12 @@ void MainWidget::on_configs_changed(std::vector<std::string>* config_names) {
     for (int i = 0; i < config_names->size(); i++) {
         QString confname = QString::fromStdString((*config_names)[i]);
 #ifdef Q_OS_MACOS
-        if (confname == "macos_titlebar_color"){
-            changeTitlebarColor(winId(), MACOS_TITLEBAR_COLOR[0], MACOS_TITLEBAR_COLOR[1], MACOS_TITLEBAR_COLOR[2], 1.0f);
+        if (confname == "macos_titlebar_color" ||
+            confname == "macos_hide_titlebar" ||
+            confname == "background_color" ||
+            confname == "dark_mode_background_color" ||
+            confname == "custom_background_color") {
+            update_macos_titlebar();
         }
 #endif
         if (confname == "use_system_theme") {
@@ -8157,6 +8338,9 @@ void MainWidget::on_configs_changed(std::vector<std::string>* config_names) {
             if (NUM_CACHED_PAGES < 6) {
                 pdf_renderer->set_num_cached_pages(NUM_CACHED_PAGES * main_document_view->get_pages_per_row());
             }
+        }
+        if (confname == "auto_crop_pages") {
+            handle_fit_to_page_width(AUTO_CROP_PAGES);
         }
         if (confname == "highlight_links") {
             opengl_widget->set_highlight_links(SHOULD_HIGHLIGHT_LINKS, false);
@@ -10510,12 +10694,15 @@ void MainWidget::add_password(std::wstring path, std::string password) {
 }
 
 void MainWidget::handle_fit_to_page_width(bool smart) {
+    smart = smart || AUTO_CROP_PAGES;
     main_document_view->fit_to_page_width(smart);
 
     if (smart) {
         int current_page = get_current_page_number();
-        if (!main_document_view->is_two_page_mode()) {
-            last_smart_fit_page = current_page;
+        if (current_page >= 0 && main_document_view->get_document()) {
+            last_smart_fit_page = main_document_view->is_two_page_mode()
+                ? main_document_view->get_page_row_range(current_page).first
+                : current_page;
         }
     }
     else {
@@ -10600,10 +10787,13 @@ void MainWidget::initialize_helper(){
 #endif
 #ifdef Q_OS_MACOS
     QWidget* helper_window = get_top_level_widget(helper_opengl_widget_);
-    if (MACOS_HIDE_TITLEBAR) {
-        hideWindowTitleBar(helper_window->winId());
+    if (helper_window) {
+        helper_window->setWindowFlag(Qt::ExpandedClientAreaHint, true);
+        helper_window->setWindowFlag(Qt::NoTitleBarBackgroundHint, true);
+        helper_window->setAttribute(Qt::WA_ContentsMarginsRespectsSafeArea, false);
     }
     helper_opengl_widget_->show();
+    update_macos_titlebar();
     helper_opengl_widget_->hide();
 #endif
 
@@ -11755,6 +11945,7 @@ QMenuBar* MainWidget::create_main_menu_bar(){
             new MenuNode{ "toggle_statusbar", "", {} },
             new MenuNode{ "toggle_horizontal_scroll_lock", "", {} },
             new MenuNode{ "toggle_pdf_annotations", "", {} },
+            new MenuNode{ "toggle_faithful_images", "", {} },
             new MenuNode{ "toggleconfig_preserve_image_colors_in_dark_mode", "Toggle preserve image colors in dark mode", {} },
             overview_view_menu
         }

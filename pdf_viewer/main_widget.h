@@ -341,6 +341,8 @@ public:
     // very limited in touch devices and we don't want to waste it using a statusbar unless it is absolutely required
     bool should_show_status_label_ = true;
     bool should_show_status_label(bool check_network=true);
+    bool should_show_scrollbar_ = false;
+    bool should_show_scrollbar();
 
     // the location of current character in sioyek's typing minigame
     std::optional<CharacterAddress> typing_location;
@@ -1067,6 +1069,7 @@ public:
     void select_next_char();
     void unselect_last_char();
     void select_word_under_cursor();
+    void update_macos_titlebar();
 };
 
 MainWidget* get_window_with_window_id(int window_id);

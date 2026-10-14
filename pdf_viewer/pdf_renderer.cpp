@@ -250,6 +250,378 @@ fz_pixmap* render_request_pixmap(fz_context* mupdf_context, fz_document* doc, co
     if (GAMMA != 1.0f) {
         fz_gamma_pixmap(mupdf_context, rendered_pixmap, GAMMA);
     }
+    if (rendered_pixmap && rendered_pixmap->n == 4 && rendered_pixmap->w > 0 && rendered_pixmap->h > 0) {
+        int w = rendered_pixmap->w;
+        int h = rendered_pixmap->h;
+        int stride = rendered_pixmap->stride;
+        unsigned char* samples = rendered_pixmap->samples;
+
+        float scale = req.zoom_level * req.display_scale;
+        if (!(scale > 0.0f)) scale = 1.0f;
+        int r_core = std::clamp((int)std::lround(3.8f * scale), 2, 128);
+        int r_core_black = std::clamp((int)std::lround(8.0f * scale), 4, 256);
+        int r_edge = std::clamp((int)std::lround(1.5f * scale), 1, 8);
+
+        std::vector<uint8_t> buf_a((size_t)w * h, 0);
+        std::vector<uint8_t> buf_b((size_t)w * h, 0);
+        std::vector<uint8_t> buf_c((size_t)w * h, 0);
+        std::vector<int> col_sum(w, 0);
+
+        for (int y = 0; y < h; y++) {
+            const unsigned char* row = samples + (size_t)y * stride;
+            uint8_t* dst = buf_a.data() + (size_t)y * w;
+            for (int x = 0; x < w; x++) {
+                const unsigned char* p = row + x * 4;
+#ifdef SIOYEK_BGRA_TEXTURES
+                int lum = (29 * p[0] + 150 * p[1] + 77 * p[2]) >> 8;
+#else
+                int lum = (77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8;
+#endif
+                int cmax = std::max({ p[0], p[1], p[2] });
+                int cmin = std::min({ p[0], p[1], p[2] });
+                int chroma = cmax - cmin;
+                dst[x] = (lum >= 210 || (lum >= 165 && chroma < 24)) ? 1 : 0;
+            }
+        }
+
+        auto morph_1d_h = [&](const std::vector<uint8_t>& src, std::vector<uint8_t>& dst, int r, bool is_dilate) {
+            int r_clamped = std::min(r, w - 1);
+            for (int y = 0; y < h; y++) {
+                const uint8_t* s = src.data() + (size_t)y * w;
+                uint8_t* d = dst.data() + (size_t)y * w;
+                int sum = 0;
+                for (int x = 0; x <= r_clamped; x++) {
+                    sum += s[x];
+                }
+                for (int x = 0; x < w; x++) {
+                    int x0 = std::max(0, x - r_clamped);
+                    int x1 = std::min(w - 1, x + r_clamped);
+                    int win_len = x1 - x0 + 1;
+                    d[x] = is_dilate ? (sum > 0 ? 1 : 0) : (sum == win_len ? 1 : 0);
+                    if (x - r_clamped >= 0) {
+                        sum -= s[x - r_clamped];
+                    }
+                    if (x + r_clamped + 1 < w) {
+                        sum += s[x + r_clamped + 1];
+                    }
+                }
+            }
+        };
+
+        auto morph_1d_v = [&](const std::vector<uint8_t>& src, std::vector<uint8_t>& dst, int r, bool is_dilate) {
+            int r_clamped = std::min(r, h - 1);
+            std::fill(col_sum.begin(), col_sum.end(), 0);
+            for (int y = 0; y <= r_clamped; y++) {
+                const uint8_t* s = src.data() + (size_t)y * w;
+                for (int x = 0; x < w; x++) {
+                    col_sum[x] += s[x];
+                }
+            }
+            for (int y = 0; y < h; y++) {
+                int y0 = std::max(0, y - r_clamped);
+                int y1 = std::min(h - 1, y + r_clamped);
+                int win_len = y1 - y0 + 1;
+                uint8_t* d = dst.data() + (size_t)y * w;
+                if (is_dilate) {
+                    for (int x = 0; x < w; x++) {
+                        d[x] = (col_sum[x] > 0) ? 1 : 0;
+                    }
+                }
+                else {
+                    for (int x = 0; x < w; x++) {
+                        d[x] = (col_sum[x] == win_len) ? 1 : 0;
+                    }
+                }
+                if (y - r_clamped >= 0) {
+                    const uint8_t* s_leave = src.data() + (size_t)(y - r_clamped) * w;
+                    for (int x = 0; x < w; x++) {
+                        col_sum[x] -= s_leave[x];
+                    }
+                }
+                if (y + r_clamped + 1 < h) {
+                    const uint8_t* s_enter = src.data() + (size_t)(y + r_clamped) * w;
+                    for (int x = 0; x < w; x++) {
+                        col_sum[x] += s_enter[x];
+                    }
+                }
+            }
+        };
+
+        // Connected-component bright filter with Open-Core Primary Panel detection + Iterative Island Chaining:
+        // - First compute `open_core` (stored in `buf_c`): pixels at the center of a solid 9pt x 9pt bright region.
+        // - A bright connected component is a Primary Bright Background Panel (2) only if it has sufficient area
+        //   AND a substantial open bright interior (`open_core`), distinguishing true page/box backgrounds from
+        //   large thin-stroked bright display text on dark covers/banners (e.g. "MODERN ELECTRODYNAMICS").
+        // - Non-primary bright islands (3) with achromatic borders (e.g. letter counters and dense grid cells in
+        //   field-line plots) iteratively chain across thin dark strokes to any connected Primary Bright Background (2).
+        {
+            int r_open = std::clamp((int)std::lround(4.5f * scale), 2, 128);
+            morph_1d_h(buf_a, buf_b, r_open, false);
+            morph_1d_v(buf_b, buf_c, r_open, false);
+
+            int min_primary_area = std::max(64, (int)std::lround(1200.0f * scale * scale));
+            int min_primary_core = std::max(16, (int)std::lround(150.0f * scale * scale));
+            int r_bg_color = std::clamp((int)std::lround(2.6f * scale), 2, 128);
+            int r_bg_gray = std::clamp((int)std::lround(5.5f * scale), 3, 128);
+
+            struct SmallIsland {
+                int start_idx;
+                int count;
+                int min_x, max_x, min_y, max_y;
+                int border_chroma_sum;
+                int border_dark_count;
+                uint8_t keep;
+            };
+            std::vector<int> island_pixels;
+            std::vector<SmallIsland> small_islands;
+            std::vector<int> queue;
+            queue.reserve(4096);
+
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    size_t idx0 = (size_t)y * w + x;
+                    if (buf_a[idx0] != 1) continue;
+
+                    queue.clear();
+                    queue.push_back((int)idx0);
+                    buf_a[idx0] = 2;
+                    int min_x = x, max_x = x, min_y = y, max_y = y;
+                    int border_chroma_sum = 0;
+                    int border_dark_count = 0;
+                    int core_count = 0;
+
+                    size_t head = 0;
+                    while (head < queue.size()) {
+                        int cur = queue[head++];
+                        if (buf_c[cur]) core_count++;
+                        int cy = cur / w;
+                        int cx = cur - cy * w;
+                        if (cx < min_x) min_x = cx;
+                        if (cx > max_x) max_x = cx;
+                        if (cy < min_y) min_y = cy;
+                        if (cy > max_y) max_y = cy;
+
+                        const int nx_arr[4] = { cx - 1, cx + 1, cx, cx };
+                        const int ny_arr[4] = { cy, cy, cy - 1, cy + 1 };
+                        for (int k = 0; k < 4; k++) {
+                            int nx = nx_arr[k], ny = ny_arr[k];
+                            if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+                            int nidx = ny * w + nx;
+                            if (buf_a[nidx] == 1) {
+                                buf_a[nidx] = 2;
+                                queue.push_back(nidx);
+                            }
+                            else if (buf_a[nidx] == 0) {
+                                const unsigned char* p = samples + (size_t)ny * stride + nx * 4;
+                                int cmax = std::max({ p[0], p[1], p[2] });
+                                int cmin = std::min({ p[0], p[1], p[2] });
+                                border_chroma_sum += (cmax - cmin);
+                                border_dark_count++;
+                            }
+                        }
+                    }
+
+                    int area = (int)queue.size();
+                    bool is_primary = (area >= min_primary_area) &&
+                                      (core_count >= min_primary_core) &&
+                                      ((long long)core_count * 10 >= area);
+                    if (!is_primary) {
+                        int start = (int)island_pixels.size();
+                        island_pixels.insert(island_pixels.end(), queue.begin(), queue.end());
+                        for (int p : queue) {
+                            buf_a[p] = 3;
+                        }
+                        small_islands.push_back({
+                            start,
+                            area,
+                            min_x, max_x, min_y, max_y,
+                            border_chroma_sum,
+                            border_dark_count,
+                            0
+                        });
+                    }
+                }
+            }
+
+            for (auto& isl : small_islands) {
+                bool is_colored_border = (isl.border_dark_count > 0) &&
+                                         (isl.border_chroma_sum >= 12 * isl.border_dark_count);
+                if (is_colored_border) {
+                    int x0 = std::max(0, isl.min_x - r_bg_color);
+                    int x1 = std::min(w - 1, isl.max_x + r_bg_color);
+                    int y0 = std::max(0, isl.min_y - r_bg_color);
+                    int y1 = std::min(h - 1, isl.max_y + r_bg_color);
+                    int win_area = (x1 - x0 + 1) * (y1 - y0 + 1);
+                    int bg_count = 0;
+                    for (int yy = y0; yy <= y1; yy++) {
+                        const uint8_t* row = buf_a.data() + (size_t)yy * w;
+                        for (int xx = x0; xx <= x1; xx++) {
+                            if (row[xx] == 2) bg_count++;
+                        }
+                    }
+                    isl.keep = (bg_count * 100 >= 12 * win_area) ? 1 : 0;
+                }
+            }
+
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (auto& isl : small_islands) {
+                    if (isl.keep) continue;
+                    bool is_colored_border = (isl.border_dark_count > 0) &&
+                                             (isl.border_chroma_sum >= 12 * isl.border_dark_count);
+                    if (is_colored_border) continue;
+
+                    int x0 = std::max(0, isl.min_x - r_bg_gray);
+                    int x1 = std::min(w - 1, isl.max_x + r_bg_gray);
+                    int y0 = std::max(0, isl.min_y - r_bg_gray);
+                    int y1 = std::min(h - 1, isl.max_y + r_bg_gray);
+                    bool found_bg = false;
+                    for (int yy = y0; yy <= y1 && !found_bg; yy++) {
+                        const uint8_t* row = buf_a.data() + (size_t)yy * w;
+                        for (int xx = x0; xx <= x1; xx++) {
+                            if (row[xx] == 2) {
+                                found_bg = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (found_bg) {
+                        isl.keep = 1;
+                        changed = true;
+                        for (int i = 0; i < isl.count; i++) {
+                            buf_a[island_pixels[isl.start_idx + i]] = 2;
+                        }
+                    }
+                }
+            }
+
+            for (const auto& isl : small_islands) {
+                uint8_t val = isl.keep ? 1 : 0;
+                for (int i = 0; i < isl.count; i++) {
+                    buf_a[island_pixels[isl.start_idx + i]] = val;
+                }
+            }
+
+            for (size_t i = 0; i < buf_a.size(); i++) {
+                if (buf_a[i] > 1) buf_a[i] = 1;
+            }
+        }
+
+        std::vector<uint8_t> bright_clean = buf_a;
+
+        // Dilate bright_clean by r_core: pixels remaining 0 are Dark Graphic Core Seed candidates
+        morph_1d_h(bright_clean, buf_b, r_core, true);
+        morph_1d_v(buf_b, buf_a, r_core, true);
+
+        // Require larger core radius (r_core_black) for pure-black ink (chroma < 12 && lum < 25)
+        // so that medium pure-black diagram dots or thick title intersections are recolored,
+        // while colored/shaded dark graphics (such as 13pt dark purple circle icons) use r_core.
+        morph_1d_h(bright_clean, buf_b, r_core_black, true);
+        morph_1d_v(buf_b, buf_c, r_core_black, true);
+        for (int y = 0; y < h; y++) {
+            const unsigned char* row = samples + (size_t)y * stride;
+            uint8_t* a_row = buf_a.data() + (size_t)y * w;
+            const uint8_t* c_row = buf_c.data() + (size_t)y * w;
+            for (int x = 0; x < w; x++) {
+                if (a_row[x] == 0 && c_row[x] == 1) {
+                    const unsigned char* p = row + x * 4;
+                    int cmax = std::max({ p[0], p[1], p[2] });
+                    int cmin = std::min({ p[0], p[1], p[2] });
+#ifdef SIOYEK_BGRA_TEXTURES
+                    int lum = (29 * p[0] + 150 * p[1] + 77 * p[2]) >> 8;
+#else
+                    int lum = (77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8;
+#endif
+                    if ((cmax - cmin) < 12 && lum < 25) {
+                        a_row[x] = 1;
+                    }
+                }
+            }
+        }
+
+        // Geodesic reconstruction: expand Dark Graphic Core Seeds (buf_a == 0) into connected
+        // dark pixels (bright_clean == 0) to restore exact circular/curved boundaries of dark graphics.
+        {
+            int max_steps = std::max(3, (int)std::lround(1.8f * r_core));
+            std::vector<int> q_curr;
+            std::vector<int> q_next;
+            q_curr.reserve((size_t)w * h / 16);
+            q_next.reserve((size_t)w * h / 16);
+
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    int idx = y * w + x;
+                    if (buf_a[idx] == 0) {
+                        if ((x > 0 && buf_a[idx - 1] == 1 && bright_clean[idx - 1] == 0) ||
+                            (x + 1 < w && buf_a[idx + 1] == 1 && bright_clean[idx + 1] == 0) ||
+                            (y > 0 && buf_a[idx - w] == 1 && bright_clean[idx - w] == 0) ||
+                            (y + 1 < h && buf_a[idx + w] == 1 && bright_clean[idx + w] == 0)) {
+                            q_curr.push_back(idx);
+                        }
+                    }
+                }
+            }
+
+            for (int step = 0; step < max_steps && !q_curr.empty(); step++) {
+                q_next.clear();
+                for (int cur : q_curr) {
+                    int cy = cur / w;
+                    int cx = cur - cy * w;
+                    for (int dy = -1; dy <= 1; dy++) {
+                        int ny = cy + dy;
+                        if (ny < 0 || ny >= h) continue;
+                        for (int dx = -1; dx <= 1; dx++) {
+                            if (dx == 0 && dy == 0) continue;
+                            int nx = cx + dx;
+                            if (nx < 0 || nx >= w) continue;
+                            int nidx = ny * w + nx;
+                            if (buf_a[nidx] == 1 && bright_clean[nidx] == 0) {
+                                buf_a[nidx] = 0;
+                                q_next.push_back(nidx);
+                            }
+                        }
+                    }
+                }
+                q_curr.swap(q_next);
+            }
+        }
+
+        // Dilate slightly to smoothly blend anti-aliased boundaries where dark graphics meet bright paper
+        morph_1d_h(buf_a, buf_b, r_edge, true);
+        morph_1d_v(buf_b, buf_c, r_edge, true);
+
+        for (int y = 0; y < h; y++) {
+            unsigned char* row = samples + (size_t)y * stride;
+            const uint8_t* m_closed = buf_a.data() + (size_t)y * w;
+            const uint8_t* m_near = buf_c.data() + (size_t)y * w;
+            for (int x = 0; x < w; x++) {
+                unsigned char* p = row + x * 4;
+                if (m_closed[x]) {
+                    p[3] = 255;
+                }
+                else if (m_near[x]) {
+#ifdef SIOYEK_BGRA_TEXTURES
+                    int lum = (29 * p[0] + 150 * p[1] + 77 * p[2]) >> 8;
+#else
+                    int lum = (77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8;
+#endif
+                    if (lum <= 140) {
+                        p[3] = 0;
+                    }
+                    else if (lum >= 220) {
+                        p[3] = 255;
+                    }
+                    else {
+                        p[3] = (unsigned char)((lum - 140) * 255 / (220 - 140));
+                    }
+                }
+                else {
+                    p[3] = 0;
+                }
+            }
+        }
+    }
     if (bands_used) {
         *bands_used = final_num_bands;
     }

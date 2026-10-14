@@ -20,11 +20,13 @@ scrolling, horizontal half-page movement, and `set_pages_per_row` commands.
 | `Ctrl+1` | Single-page view |
 | `Ctrl+2`–`Ctrl+9` | Select that many pages per row |
 | `D` | Toggle single-page view and the last multi-page layout |
-| `Ctrl+d` / `Ctrl+Shift+d` | Start page 1 in column 2 / column 1, with the default `first_page_column 0` |
+| `Ctrl+d` / `Ctrl+Shift+d` | Start page 1 standalone (default) / paired in column 1 (`first_page_column 0`) |
 | `Ctrl+p` | Search recently opened documents |
 | `Ctrl+^` | Switch to the previous file |
 | `Space` / `Shift+Space` | Scroll down / up without skipping page boundaries |
 | `a` / `s` | Fit the row to height / width |
+| `A` / `S` | Smart-fit the row to height / width (cropping margins) |
+| `C` | Toggle persistent auto-page-crop across pages |
 | `i` / `Ctrl+r` | Toggle Gruvbox page recoloring |
 | `:` | Open the command selector |
 

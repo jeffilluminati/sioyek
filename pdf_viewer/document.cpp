@@ -717,18 +717,39 @@ float Document::get_page_width_median() {
 
 float Document::get_page_size_smart(bool width, int page_index, float* left_ratio, float* right_ratio, int* normal_page_width) {
 
+    float standard_size = 500.0f;
+    {
+        std::lock_guard guard(page_dims_mutex);
+        if (page_index >= 0) {
+            if (width && page_index < static_cast<int>(page_widths.size())) {
+                standard_size = page_widths[page_index];
+            }
+            else if (!width && page_index < static_cast<int>(page_heights.size())) {
+                standard_size = page_heights[page_index];
+            }
+        }
+    }
+
+    auto& ratio_cache = width ? cached_smart_width_ratios : cached_smart_height_ratios;
+    auto cached_it = ratio_cache.find(page_index);
+    if (cached_it != ratio_cache.end()) {
+        *left_ratio = cached_it->second.first;
+        *right_ratio = cached_it->second.second;
+        *normal_page_width = standard_size;
+        return (*right_ratio - *left_ratio) * standard_size;
+    }
+
     fz_pixmap* pixmap = get_small_pixmap(page_index);
+    if (pixmap == nullptr || pixmap->w <= 0 || pixmap->h <= 0) {
+        *left_ratio = 0.0f;
+        *right_ratio = 1.0f;
+        *normal_page_width = standard_size;
+        return standard_size;
+    }
 
     // project the small pixmap into a histogram (the `width` parameter determines whether we do this
     // horizontally or vertically)
-    std::vector<float> histogram;
-
-    if (width) {
-        histogram.resize(pixmap->w);
-    }
-    else {
-        histogram.resize(pixmap->h);
-    }
+    std::vector<float> histogram(width ? pixmap->w : pixmap->h, 0.0f);
 
     float total_nonzero = 0.0f;
     for (int i = 0; i < pixmap->w; i++) {
@@ -752,34 +773,42 @@ float Document::get_page_size_smart(bool width, int page_index, float* left_rati
         }
     }
 
+    if (total_nonzero <= 0.0f || histogram.empty()) {
+        *left_ratio = 0.0f;
+        *right_ratio = 1.0f;
+        ratio_cache[page_index] = { *left_ratio, *right_ratio };
+        *normal_page_width = standard_size;
+        return standard_size;
+    }
+
     float average_nonzero = total_nonzero / histogram.size();
     float nonzero_threshold = average_nonzero / 3.0f;
 
     int start_index = 0;
-    int end_index = histogram.size() - 1;
+    int end_index = static_cast<int>(histogram.size()) - 1;
 
     // find the first index in both directions where the histogram is nonzero
-    while ((start_index < end_index) && (histogram[start_index++] < nonzero_threshold));
-    while ((start_index < end_index) && (histogram[end_index--] < nonzero_threshold));
-
+    while ((start_index < end_index) && (histogram[start_index] < nonzero_threshold)) {
+        start_index++;
+    }
+    while ((start_index < end_index) && (histogram[end_index] < nonzero_threshold)) {
+        end_index--;
+    }
 
     int border = 10;
     start_index = std::max<int>(start_index - border, 0);
-    end_index = std::min<int>(end_index + border, histogram.size() - 1);
+    end_index = std::min<int>(end_index + border, static_cast<int>(histogram.size()) - 1);
 
     *left_ratio = static_cast<float>(start_index) / histogram.size();
     *right_ratio = static_cast<float>(end_index) / histogram.size();
-
-    float standard_size;
-    if (width) {
-        standard_size = page_widths[page_index];
-    }
-    else {
-        standard_size = page_heights[page_index];
+    if (*right_ratio <= *left_ratio) {
+        *left_ratio = 0.0f;
+        *right_ratio = 1.0f;
     }
 
-    float ratio = static_cast<float>(end_index - start_index) / histogram.size();
+    ratio_cache[page_index] = { *left_ratio, *right_ratio };
 
+    float ratio = *right_ratio - *left_ratio;
     *normal_page_width = standard_size;
 
     return ratio * standard_size;
@@ -3404,6 +3433,8 @@ void Document::clear_document_caches() {
         fz_drop_pixmap(context, cached_small_pixmap);
     }
     cached_small_pixmaps.clear();
+    cached_smart_width_ratios.clear();
+    cached_smart_height_ratios.clear();
 
     for (auto [_, cached_stext_page] : cached_stext_pages) {
         fz_drop_stext_page(context, cached_stext_page);

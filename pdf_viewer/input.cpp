@@ -4772,6 +4772,37 @@ public:
     bool requires_document() { return false; }
 };
 
+class ToggleFaithfulImagesCommand : public Command {
+public:
+    static inline const std::string cname = "toggle_faithful_images";
+    static inline const std::string hname = "Toggle faithful images in dark mode";
+    ToggleFaithfulImagesCommand(MainWidget* w) : Command(cname, w) {};
+
+    void perform() {
+        extern bool FAITHFUL_IMAGES_IN_DARK_MODE;
+        FAITHFUL_IMAGES_IN_DARK_MODE = !FAITHFUL_IMAGES_IN_DARK_MODE;
+        widget->invalidate_render();
+    }
+
+    bool requires_document() { return false; }
+};
+
+class ToggleAutoCropCommand : public Command {
+public:
+    static inline const std::string cname = "toggle_auto_crop";
+    static inline const std::string hname = "Toggle automatic page margin cropping";
+    ToggleAutoCropCommand(MainWidget* w) : Command(cname, w) {};
+
+    void perform() {
+        extern bool AUTO_CROP_PAGES;
+        AUTO_CROP_PAGES = !AUTO_CROP_PAGES;
+        widget->handle_fit_to_page_width(AUTO_CROP_PAGES);
+        widget->invalidate_render();
+    }
+
+    bool requires_document() { return false; }
+};
+
 class TogglePresentationModeCommand : public Command {
 public:
     static inline const std::string cname = "toggle_presentation_mode";
@@ -5460,8 +5491,13 @@ public:
     ZoomInCursorCommand(MainWidget* w) : Command(cname, w) {};
 
     void perform() {
-        QPoint mouse_pos = widget->mapFromGlobal(widget->cursor_pos());
-        widget->main_document_view->zoom_in_cursor({ mouse_pos.x(), mouse_pos.y() });
+        if (widget->main_document_view->is_two_page_mode()) {
+            widget->main_document_view->zoom_in();
+        }
+        else {
+            QPoint mouse_pos = widget->mapFromGlobal(widget->cursor_pos());
+            widget->main_document_view->zoom_in_cursor({ mouse_pos.x(), mouse_pos.y() });
+        }
         widget->last_smart_fit_page = {};
     }
 
@@ -5474,8 +5510,13 @@ public:
     ZoomOutCursorCommand(MainWidget* w) : Command(cname, w) {};
 
     void perform() {
-        QPoint mouse_pos = widget->mapFromGlobal(widget->cursor_pos());
-        widget->main_document_view->zoom_out_cursor({ mouse_pos.x(), mouse_pos.y() });
+        if (widget->main_document_view->is_two_page_mode()) {
+            widget->main_document_view->zoom_out();
+        }
+        else {
+            QPoint mouse_pos = widget->mapFromGlobal(widget->cursor_pos());
+            widget->main_document_view->zoom_out_cursor({ mouse_pos.x(), mouse_pos.y() });
+        }
         widget->last_smart_fit_page = {};
     }
 
@@ -7450,6 +7491,8 @@ CommandManager::CommandManager(ConfigManager* config_manager) {
     register_command<MoveVisualMarkNextCommand>();
     register_command<MoveVisualMarkPrevCommand>();
     register_command<ToggleCustomColorMode>();
+    register_command<ToggleFaithfulImagesCommand>();
+    register_command<ToggleAutoCropCommand>();
     register_command<SetSelectHighlightTypeCommand>();
     register_command<SetFreehandType>();
     register_command<SetFreehandAlphaCommand>();

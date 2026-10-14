@@ -392,6 +392,7 @@ void PdfViewOpenGLWidget::initializeGL() {
 #endif
 
         shared_gl_objects.dark_mode_contrast_uniform_location = glGetUniformLocation(shared_gl_objects.rendered_dark_program, "contrast");
+        shared_gl_objects.dark_mode_preserve_faithful_uniform_location = glGetUniformLocation(shared_gl_objects.rendered_dark_program, "preserve_faithful");
         //shared_gl_objects.gamma_uniform_location = glGetUniformLocation(shared_gl_objects.rendered_program, "gamma");
 
         shared_gl_objects.highlight_color_uniform_location = glGetUniformLocation(shared_gl_objects.highlight_program, "highlight_color");
@@ -401,6 +402,7 @@ void PdfViewOpenGLWidget::initializeGL() {
         shared_gl_objects.line_time_uniform_location = glGetUniformLocation(shared_gl_objects.vertical_line_program, "time");
 
         shared_gl_objects.custom_color_transform_uniform_location = glGetUniformLocation(shared_gl_objects.custom_color_program, "transform_matrix");
+        shared_gl_objects.custom_color_preserve_faithful_uniform_location = glGetUniformLocation(shared_gl_objects.custom_color_program, "preserve_faithful");
 
         shared_gl_objects.separator_background_color_uniform_location = glGetUniformLocation(shared_gl_objects.separator_program, "background_color");
         shared_gl_objects.freehand_line_color_uniform_location = glGetUniformLocation(shared_gl_objects.line_program, "line_color");
@@ -2770,17 +2772,20 @@ void PdfViewOpenGLWidget::toggle_custom_color_mode() {
 }
 
 void PdfViewOpenGLWidget::bind_program(ColorPalette forced_palette) {
+    extern bool FAITHFUL_IMAGES_IN_DARK_MODE;
     ColorPalette mode = forced_palette == None ? color_mode : forced_palette;
+    float preserve_faithful = (forced_palette == None && FAITHFUL_IMAGES_IN_DARK_MODE) ? 1.0f : 0.0f;
     if (mode == ColorPalette::Dark) {
         glUseProgram(shared_gl_objects.rendered_dark_program);
         glUniform1f(shared_gl_objects.dark_mode_contrast_uniform_location, DARK_MODE_CONTRAST);
+        glUniform1f(shared_gl_objects.dark_mode_preserve_faithful_uniform_location, preserve_faithful);
     }
     else if (mode == ColorPalette::Custom) {
         glUseProgram(shared_gl_objects.custom_color_program);
         float transform_matrix[16];
         get_custom_color_transform_matrix(transform_matrix);
         glUniformMatrix4fv(shared_gl_objects.custom_color_transform_uniform_location, 1, GL_TRUE, transform_matrix);
-
+        glUniform1f(shared_gl_objects.custom_color_preserve_faithful_uniform_location, preserve_faithful);
     }
     else {
         glUseProgram(shared_gl_objects.rendered_program);

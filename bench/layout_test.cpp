@@ -21,6 +21,7 @@
 extern int PAGES_PER_ROW;
 extern int FIRST_PAGE_COLUMN;
 extern bool RECTO_VERSO_ADJUSTMENT;
+extern bool AUTO_CROP_PAGES;
 extern bool SCROLL_PAST_DOCUMENT_ENDS;
 extern bool SAME_WIDTH;
 extern float PAGE_SPACE_X;
@@ -100,8 +101,13 @@ public:
 };
 
 static void test_uniform(LayoutView& view) {
+    check(RECTO_VERSO_ADJUSTMENT, "standalone first page is enabled by default");
     PAGES_PER_ROW = 2;
     FIRST_PAGE_COLUMN = 0;
+    view.refresh_page_layout();
+    check(view.get_page_row_range(0) == std::pair<int, int>{0, 1}, "default dual-page mode places first page standalone on its own row");
+    near(view.rect(0).x0, 10, "default dual-page cover occupies right column");
+
     RECTO_VERSO_ADJUSTMENT = false;
     view.refresh_page_layout();
     near(view.rect(0).x0, -610, "two columns: first page starts left of center");
@@ -191,14 +197,28 @@ static void test_uniform(LayoutView& view) {
     view.refresh_page_layout();
     view.focus(3);
     view.fit_to_page_width(true);
-    check(std::isfinite(view.get_zoom_level()) && view.get_zoom_level() > 0, "smart row fit gives a finite positive zoom");
+    float smart_zoom = view.get_zoom_level();
+    check(std::isfinite(smart_zoom) && smart_zoom > 1200.0f / 1840, "smart row fit zooms in past white margins");
     check(view.get_page_space_x() < 0, "smart row fit crops interior margins");
     view.fit_to_page_width();
     near(view.get_page_space_x(), PAGE_SPACE_X, "normal fit restores configured gap");
     near(view.get_page_space_y(), PAGE_SPACE_Y, "vertical gap getter returns vertical gap");
 
+    AUTO_CROP_PAGES = true;
+    view.fit_to_page_width();
+    near(view.get_zoom_level(), smart_zoom, "auto_crop_pages crops margins on standard fit_to_page_width");
+    check(view.get_page_space_x() < 0, "auto_crop_pages crops interior margins in multi-page mode");
+    AUTO_CROP_PAGES = false;
+    view.fit_to_page_width();
+    near(view.get_page_space_x(), PAGE_SPACE_X, "disabling auto_crop_pages restores normal gap");
+
     view.toggle_two_page();
     check(!view.is_two_page_mode() && view.get_pages_per_row() == 1, "toggle returns to single-page mode");
+    float uncropped_single_zoom = view.get_zoom_level();
+    AUTO_CROP_PAGES = true;
+    view.fit_to_page_width();
+    check(view.get_zoom_level() > uncropped_single_zoom, "auto_crop_pages zooms in past margins in single-page mode");
+    AUTO_CROP_PAGES = false;
     view.toggle_two_page();
     check(view.is_two_page_mode() && view.get_pages_per_row() == 3, "toggle restores configured column count");
 
@@ -236,6 +256,18 @@ static void test_mixed(LayoutView& view) {
     view.fit_to_page_width();
     view.fit_to_page_height_width_minimum(40);
     near(view.get_zoom_level(), 0.36f, "presentation fits row height and status bar");
+
+    AUTO_CROP_PAGES = true;
+    view.fit_to_page_width(true);
+    float fitted_offset_x = view.get_virtual_offset().x;
+    float fitted_zoom = view.get_zoom_level();
+    view.zoom_in(1.2f);
+    near(view.get_virtual_offset().x, fitted_offset_x, "two-page zoom in stays centered on spread");
+    check(view.get_zoom_level() > fitted_zoom, "zoom in increases zoom with auto crop enabled");
+    check(!view.get_is_auto_resize_mode(), "zoom in disables auto resize mode");
+    view.zoom_out(1.2f);
+    near(view.get_virtual_offset().x, fitted_offset_x, "two-page zoom out stays centered on spread");
+    AUTO_CROP_PAGES = false;
 }
 
 static void test_single_document(LayoutView& view) {

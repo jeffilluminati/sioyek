@@ -109,6 +109,8 @@ private:
 
     std::vector<std::pair<int, fz_stext_page*>> cached_stext_pages;
     std::vector<std::pair<int, fz_pixmap*>> cached_small_pixmaps;
+    std::unordered_map<int, std::pair<float, float>> cached_smart_width_ratios;
+    std::unordered_map<int, std::pair<float, float>> cached_smart_height_ratios;
     std::map<int, std::optional<std::string>> cached_fastread_highlights;
     PdfLink merge_links(const std::vector<PdfLink>& links_to_merge);
 
