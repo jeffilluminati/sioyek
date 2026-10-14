@@ -30,23 +30,23 @@ scrolling, horizontal half-page movement, and `set_pages_per_row` commands.
 | `i` / `Ctrl+r` | Toggle Gruvbox page recoloring |
 | `:` | Open the command selector |
 
-The theme uses Menlo at size 14. If Menlo is unavailable, set `ui_font` and
-`status_font` to an installed monospace font. Set the optional
+The theme uses a monospace font at size 14. `ui_font` and `status_font` accept a
+comma-separated fallback list (`Menlo, DejaVu Sans Mono, monospace`), so Menlo is
+used on macOS and DejaVu Sans Mono or the system monospace font on Linux. Set the optional
 `default_open_file_path` to your book directory; the shared profile leaves it
 unset so the file picker uses its default location.
 
 ## Printing
 
-The `p` shortcut invokes the custom `_print` command. On macOS, the included
-`print.sh` opens Preview's print dialog. Install it on Sioyek's `PATH` as
-`sioyek-print`:
+The `p` shortcut invokes the custom `_print` command, which runs the included
+`print.sh`. Install it on Sioyek's `PATH` as `sioyek-print`:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
 install -m 755 configs/preferred/print.sh "$HOME/.local/bin/sioyek-print"
 ```
 
-On Linux, replace the `_print` definition in `prefs_user.config` with your chosen
-PDF viewer or print command. For example, `new_command _print lp %1` sends the
-current file directly to the default printer through CUPS. The included helper
-requires macOS and `osascript`.
+On macOS it opens Preview's print dialog. On Linux it opens Okular's or Evince's
+print dialog if either is installed, and otherwise sends the file straight to the
+default CUPS printer with `lp`. Set `SIOYEK_PRINT_CMD` (for example
+`SIOYEK_PRINT_CMD="lp -d office"`) to use a different command.

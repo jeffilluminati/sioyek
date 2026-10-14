@@ -4676,6 +4676,25 @@ QString get_status_font_face_name() {
     }
 }
 
+QFont font_from_face_names(const QString& face_names) {
+    QStringList families;
+    for (const QString& name : face_names.split(',', Qt::SkipEmptyParts)) {
+        QString trimmed = name.trimmed();
+        if (trimmed.size() > 0) {
+            families.append(trimmed);
+        }
+    }
+
+    QFont font;
+    if (families.size() > 0) {
+        font.setFamilies(families);
+        if (families.last().compare("monospace", Qt::CaseInsensitive) == 0) {
+            font.setStyleHint(QFont::Monospace);
+        }
+    }
+    return font;
+}
+
 
 QtTextToSpeechHandler::QtTextToSpeechHandler() {
     tts = new QTextToSpeech();

@@ -15,6 +15,7 @@
 #include <qcommandlineparser.h>
 
 #include <QKeyEvent>
+#include <QFont>
 #include <qstandarditemmodel.h>
 #include <qpoint.h>
 #include <qjsonarray.h>
@@ -446,6 +447,9 @@ bool is_in(char c, std::vector<char> candidates);
 bool is_doc_valid(fz_context* ctx, std::string path);
 QString get_ui_font_face_name();
 QString get_status_font_face_name();
+// Builds a font from a comma-separated list of family names (e.g. "Menlo, DejaVu Sans Mono, monospace"),
+// so a config can name fonts that only exist on some platforms and fall back to the next one.
+QFont font_from_face_names(const QString& face_names);
 std::vector<fz_stext_char*> reorder_stext_line(fz_stext_line* line);
 std::vector<fz_stext_char*> reorder_mixed_stext_line(fz_stext_line* line);
 bool should_trigger_delete(QKeyEvent *key_event);

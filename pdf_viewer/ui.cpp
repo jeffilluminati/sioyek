@@ -1522,8 +1522,8 @@ BaseSelectorWidget::BaseSelectorWidget(QAbstractItemView* item_view, bool fuzzy,
 
     QString font_face = get_ui_font_face_name();
     if (font_face.size() > 0) {
-        abstract_item_view->setFont(font_face);
-        line_edit->setFont(font_face);
+        abstract_item_view->setFont(font_from_face_names(font_face));
+        line_edit->setFont(font_from_face_names(font_face));
     }
 }
 

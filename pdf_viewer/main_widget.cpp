@@ -993,7 +993,7 @@ MainWidget::MainWidget(fz_context* mupdf_context,
     main_document_view = new DocumentView(db_manager, document_manager, checksummer);
     opengl_widget = new PdfViewOpenGLWidget(main_document_view, pdf_renderer, config_manager, false, this);
 
-    QFont label_font = QFont(get_status_font_face_name());
+    QFont label_font = font_from_face_names(get_status_font_face_name());
     label_font.setStyleHint(QFont::TypeWriter);
 
     status_label = new QWidget(this);
@@ -1988,13 +1988,13 @@ void MainWidget::move_document_screens(int num_screens) {
 void MainWidget::on_config_file_changed(ConfigManager* new_config) {
 
     status_label->setStyleSheet(get_status_stylesheet());
-    status_label->setFont(QFont(get_status_font_face_name()));
+    status_label->setFont(font_from_face_names(get_status_font_face_name()));
     text_command_line_edit_container->setStyleSheet(get_status_stylesheet());
-    text_command_line_edit->setFont(QFont(get_status_font_face_name()));
+    text_command_line_edit->setFont(font_from_face_names(get_status_font_face_name()));
 
     text_command_line_edit_label->setStyleSheet(get_status_stylesheet());
     text_command_line_edit->setStyleSheet(get_status_stylesheet());
-    command_hints_label->setFont(QFont(get_status_font_face_name()));
+    command_hints_label->setFont(font_from_face_names(get_status_font_face_name()));
     command_hints_label->setStyleSheet(get_status_stylesheet());
     //status_label->setStyleSheet(get_status_stylesheet());
 
